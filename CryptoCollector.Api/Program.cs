@@ -3,6 +3,7 @@ using CryptoCollector.Api.Models;
 using CryptoCollector.Api.Options;
 using CryptoCollector.Api.Services;
 using CryptoCollector.Exchange.Bybit;
+using CryptoCollector.Exchange.Deribit;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -18,6 +19,7 @@ builder.Services.AddSingleton<MinuteAggregationService>();
 builder.Services.AddSingleton<IMarketDataSink>(sp => sp.GetRequiredService<MinuteAggregationService>());
 builder.Services.AddHostedService(sp => sp.GetRequiredService<MinuteAggregationService>());
 builder.Services.AddBybitExchange(builder.Configuration);
+builder.Services.AddDeribitExchange(builder.Configuration);
 
 var app = builder.Build();
 
@@ -43,7 +45,7 @@ app.MapGet("/history/trades", async (
     DailyParquetStore store,
     CancellationToken cancellationToken) =>
 {
-    if (!exchange.Equals("bybit", StringComparison.OrdinalIgnoreCase))
+    if (!IsSupportedExchange(exchange))
     {
         return Results.BadRequest("Unsupported exchange.");
     }
@@ -89,7 +91,7 @@ app.MapGet("/history/tickers", async (
     DailyParquetStore store,
     CancellationToken cancellationToken) =>
 {
-    if (!exchange.Equals("bybit", StringComparison.OrdinalIgnoreCase))
+    if (!IsSupportedExchange(exchange))
     {
         return Results.BadRequest("Unsupported exchange.");
     }
@@ -125,7 +127,7 @@ app.MapGet("/history/option-chain", async (
     DailyParquetStore store,
     CancellationToken cancellationToken) =>
 {
-    if (!exchange.Equals("bybit", StringComparison.OrdinalIgnoreCase))
+    if (!IsSupportedExchange(exchange))
     {
         return Results.BadRequest("Unsupported exchange.");
     }
@@ -205,5 +207,9 @@ app.MapGet("/history/option-chain", async (
 .WithSummary("Get aggregated option-chain snapshots by minute.")
 .WithDescription("Returns one-minute option-chain snapshots. When both 'from' and 'to' are omitted, returns the latest available chain snapshot.")
 .WithTags("History");
+
+static bool IsSupportedExchange(string exchange) =>
+    exchange.Equals("bybit", StringComparison.OrdinalIgnoreCase) ||
+    exchange.Equals("deribit", StringComparison.OrdinalIgnoreCase);
 
 app.Run();

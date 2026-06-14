@@ -2,4 +2,5 @@
   <Project Path="CryptoCollector.API.Exchange/CryptoCollector.API.Exchange.csproj" />
   <Project Path="CryptoCollector.Api/CryptoCollector.Api.csproj" />
   <Project Path="CryptoCollector.Exchange.Bybit/CryptoCollector.Exchange.Bybit.csproj" />
+  <Project Path="CryptoCollector.Exchange.Deribit/CryptoCollector.Exchange.Deribit.csproj" />
 </Solution>

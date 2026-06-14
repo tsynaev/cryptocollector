@@ -174,20 +174,9 @@ public sealed class MinuteAggregationService(
         var tickerRows = Drain(_tickerBars, cutoff, static accumulator => accumulator.Build());
         var optionRows = Drain(_optionBars, cutoff, static accumulator => accumulator.Build());
 
-        if (tradeRows.Count > 0)
-        {
-            await store.AppendAsync("bybit", DataSetNames.Trades, tradeRows, cancellationToken);
-        }
-
-        if (tickerRows.Count > 0)
-        {
-            await store.AppendAsync("bybit", DataSetNames.Tickers, tickerRows, cancellationToken);
-        }
-
-        if (optionRows.Count > 0)
-        {
-            await store.AppendAsync("bybit", DataSetNames.OptionChain, optionRows, cancellationToken);
-        }
+        await AppendByExchangeAsync(DataSetNames.Trades, tradeRows, cancellationToken);
+        await AppendByExchangeAsync(DataSetNames.Tickers, tickerRows, cancellationToken);
+        await AppendByExchangeAsync(DataSetNames.OptionChain, optionRows, cancellationToken);
 
         if (tradeRows.Count + tickerRows.Count + optionRows.Count > 0)
         {
@@ -206,8 +195,7 @@ public sealed class MinuteAggregationService(
             if (_lastReportedMinute != reportedMinute)
             {
                 _lastReportedMinute = reportedMinute;
-                Console.WriteLine(
-                    $"[{DateTimeOffset.UtcNow:O}] minute={reportedMinute:yyyy-MM-dd HH:mm}Z trades={tradeRows.Count} tickers={tickerRows.Count} optionChain={optionRows.Count} pendingTrades={_tradeRows.Count} pendingTickers={_tickerBars.Count} pendingOptionChain={_optionBars.Count} seenTradeIds={_seenTradeIds.Count}");
+                WriteExchangeStats(reportedMinute, tradeRows, tickerRows, optionRows);
             }
         }
     }
@@ -276,6 +264,46 @@ public sealed class MinuteAggregationService(
     private static DateTime FloorToMinute(DateTime value) =>
         new(value.Year, value.Month, value.Day, value.Hour, value.Minute, 0, DateTimeKind.Utc);
 
+    private async Task AppendByExchangeAsync<T>(string dataSet, IReadOnlyCollection<T> rows, CancellationToken cancellationToken)
+        where T : class, ITimeSeriesRecord
+    {
+        foreach (var exchangeGroup in rows.GroupBy(static x => x.Exchange, StringComparer.OrdinalIgnoreCase))
+        {
+            await store.AppendAsync(exchangeGroup.Key, dataSet, exchangeGroup.ToArray(), cancellationToken);
+        }
+    }
+
+    private void WriteExchangeStats(
+        DateTime reportedMinute,
+        IReadOnlyCollection<TradeRecord> tradeRows,
+        IReadOnlyCollection<TickerMinuteBar> tickerRows,
+        IReadOnlyCollection<OptionChainMinuteBar> optionRows)
+    {
+        var exchanges = tradeRows.Select(static x => x.Exchange)
+            .Concat(tickerRows.Select(static x => x.Exchange))
+            .Concat(optionRows.Select(static x => x.Exchange))
+            .Concat(_tradeRows.Values.Select(static x => x.Exchange))
+            .Concat(_tickerBars.Values.Select(x => x.Exchange))
+            .Concat(_optionBars.Values.Select(x => x.Exchange))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(static x => x, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        foreach (var exchange in exchanges)
+        {
+            var tradeCount = tradeRows.Count(x => x.Exchange.Equals(exchange, StringComparison.OrdinalIgnoreCase));
+            var tickerCount = tickerRows.Count(x => x.Exchange.Equals(exchange, StringComparison.OrdinalIgnoreCase));
+            var optionCount = optionRows.Count(x => x.Exchange.Equals(exchange, StringComparison.OrdinalIgnoreCase));
+            var pendingTradeCount = _tradeRows.Values.Count(x => x.Exchange.Equals(exchange, StringComparison.OrdinalIgnoreCase));
+            var pendingTickerCount = _tickerBars.Values.Count(x => x.Exchange.Equals(exchange, StringComparison.OrdinalIgnoreCase));
+            var pendingOptionCount = _optionBars.Values.Count(x => x.Exchange.Equals(exchange, StringComparison.OrdinalIgnoreCase));
+            var seenTradeCount = _seenTradeIds.Keys.Count(key => key.StartsWith($"{exchange}|", StringComparison.OrdinalIgnoreCase));
+
+            Console.WriteLine(
+                $"[{DateTimeOffset.UtcNow:O}] exchange={exchange} minute={reportedMinute:yyyy-MM-dd HH:mm}Z trades={tradeCount} tickers={tickerCount} optionChain={optionCount} pendingTrades={pendingTradeCount} pendingTickers={pendingTickerCount} pendingOptionChain={pendingOptionCount} seenTradeIds={seenTradeCount}");
+        }
+    }
+
     private void IngestTickerAsJson<TTicker>(InstrumentDefinition instrument, TTicker payload, DateTimeOffset eventTimestamp)
     {
         using var document = JsonDocument.Parse(JsonSerializer.Serialize(payload));
@@ -301,6 +329,16 @@ public sealed class MinuteAggregationService(
         }
 
         return decimal.TryParse(raw, NumberStyles.Any, CultureInfo.InvariantCulture, out var value) ? value : null;
+    }
+
+    private static decimal? ReadNestedNullableDecimal(JsonElement element, string propertyName, string nestedPropertyName)
+    {
+        if (!element.TryGetProperty(propertyName, out var property) || property.ValueKind != JsonValueKind.Object)
+        {
+            return null;
+        }
+
+        return ReadNullableDecimal(property, nestedPropertyName);
     }
 
     private static DateTime? ReadNullableUnixMilliseconds(JsonElement element, string propertyName)
@@ -340,6 +378,7 @@ public sealed class MinuteAggregationService(
     private abstract class MinuteAccumulatorBase(InstrumentDefinition instrument, DateTime minute)
     {
         protected InstrumentDefinition Instrument { get; } = instrument;
+        public string Exchange => Instrument.Exchange;
         public DateTime Minute { get; } = minute;
     }
 
@@ -369,16 +408,26 @@ public sealed class MinuteAggregationService(
             lock (_gate)
             {
                 _lastPrice = ReadNullableDecimal(payload, "lastPrice") ?? _lastPrice;
+                _lastPrice = ReadNullableDecimal(payload, "last_price") ?? _lastPrice;
                 _markPrice = ReadNullableDecimal(payload, "markPrice") ?? _markPrice;
+                _markPrice = ReadNullableDecimal(payload, "mark_price") ?? _markPrice;
                 _indexPrice = ReadNullableDecimal(payload, "indexPrice") ?? _indexPrice;
+                _indexPrice = ReadNullableDecimal(payload, "index_price") ?? _indexPrice;
                 _bidPrice = ReadNullableDecimal(payload, "bid1Price") ?? _bidPrice;
+                _bidPrice = ReadNullableDecimal(payload, "best_bid_price") ?? _bidPrice;
                 _bidSize = ReadNullableDecimal(payload, "bid1Size") ?? _bidSize;
+                _bidSize = ReadNullableDecimal(payload, "best_bid_amount") ?? _bidSize;
                 _askPrice = ReadNullableDecimal(payload, "ask1Price") ?? _askPrice;
+                _askPrice = ReadNullableDecimal(payload, "best_ask_price") ?? _askPrice;
                 _askSize = ReadNullableDecimal(payload, "ask1Size") ?? _askSize;
+                _askSize = ReadNullableDecimal(payload, "best_ask_amount") ?? _askSize;
                 _openInterest = ReadNullableDecimal(payload, "openInterest") ?? _openInterest;
+                _openInterest = ReadNullableDecimal(payload, "open_interest") ?? _openInterest;
                 _openInterestValue = ReadNullableDecimal(payload, "openInterestValue") ?? _openInterestValue;
                 _volume24h = ReadNullableDecimal(payload, "volume24h") ?? _volume24h;
+                _volume24h = ReadNestedNullableDecimal(payload, "stats", "volume") ?? _volume24h;
                 _turnover24h = ReadNullableDecimal(payload, "turnover24h") ?? _turnover24h;
+                _turnover24h = ReadNestedNullableDecimal(payload, "stats", "volume_usd") ?? _turnover24h;
                 _fundingRate = ReadNullableDecimal(payload, "fundingRate") ?? _fundingRate;
                 _basisRate = ReadNullableDecimal(payload, "basisRate") ?? _basisRate;
                 _basisRateYear = ReadNullableDecimal(payload, "basisRateYear") ?? _basisRateYear;
@@ -455,26 +504,45 @@ public sealed class MinuteAggregationService(
             lock (_gate)
             {
                 _bidPrice = ReadNullableDecimal(payload, "bidPrice") ?? ReadNullableDecimal(payload, "bid1Price") ?? _bidPrice;
+                _bidPrice = ReadNullableDecimal(payload, "bid_price") ?? ReadNullableDecimal(payload, "best_bid_price") ?? _bidPrice;
                 _bidSize = ReadNullableDecimal(payload, "bidSize") ?? ReadNullableDecimal(payload, "bid1Size") ?? _bidSize;
+                _bidSize = ReadNullableDecimal(payload, "best_bid_amount") ?? _bidSize;
                 _bidIv = ReadNullableDecimal(payload, "bidIv") ?? ReadNullableDecimal(payload, "bid1Iv") ?? _bidIv;
+                _bidIv = ReadNullableDecimal(payload, "bid_iv") ?? _bidIv;
                 _askPrice = ReadNullableDecimal(payload, "askPrice") ?? ReadNullableDecimal(payload, "ask1Price") ?? _askPrice;
+                _askPrice = ReadNullableDecimal(payload, "ask_price") ?? ReadNullableDecimal(payload, "best_ask_price") ?? _askPrice;
                 _askSize = ReadNullableDecimal(payload, "askSize") ?? ReadNullableDecimal(payload, "ask1Size") ?? _askSize;
+                _askSize = ReadNullableDecimal(payload, "best_ask_amount") ?? _askSize;
                 _askIv = ReadNullableDecimal(payload, "askIv") ?? ReadNullableDecimal(payload, "ask1Iv") ?? _askIv;
+                _askIv = ReadNullableDecimal(payload, "ask_iv") ?? _askIv;
                 _lastPrice = ReadNullableDecimal(payload, "lastPrice") ?? _lastPrice;
+                _lastPrice = ReadNullableDecimal(payload, "last_price") ?? _lastPrice;
                 _markPrice = ReadNullableDecimal(payload, "markPrice") ?? _markPrice;
+                _markPrice = ReadNullableDecimal(payload, "mark_price") ?? _markPrice;
                 _indexPrice = ReadNullableDecimal(payload, "indexPrice") ?? _indexPrice;
+                _indexPrice = ReadNullableDecimal(payload, "index_price") ?? _indexPrice;
                 _markIv = ReadNullableDecimal(payload, "markPriceIv") ?? ReadNullableDecimal(payload, "markIv") ?? _markIv;
+                _markIv = ReadNullableDecimal(payload, "mark_iv") ?? _markIv;
                 _underlyingPrice = ReadNullableDecimal(payload, "underlyingPrice") ?? _underlyingPrice;
+                _underlyingPrice = ReadNullableDecimal(payload, "underlying_price") ?? _underlyingPrice;
                 _openInterest = ReadNullableDecimal(payload, "openInterest") ?? _openInterest;
+                _openInterest = ReadNullableDecimal(payload, "open_interest") ?? _openInterest;
                 _volume24h = ReadNullableDecimal(payload, "volume24h") ?? _volume24h;
+                _volume24h = ReadNestedNullableDecimal(payload, "stats", "volume") ?? _volume24h;
                 _turnover24h = ReadNullableDecimal(payload, "turnover24h") ?? _turnover24h;
+                _turnover24h = ReadNestedNullableDecimal(payload, "stats", "volume_usd") ?? _turnover24h;
                 _totalVolume = ReadNullableDecimal(payload, "totalVolume") ?? _totalVolume;
                 _totalTurnover = ReadNullableDecimal(payload, "totalTurnover") ?? _totalTurnover;
                 _delta = ReadNullableDecimal(payload, "delta") ?? _delta;
+                _delta = ReadNestedNullableDecimal(payload, "greeks", "delta") ?? _delta;
                 _gamma = ReadNullableDecimal(payload, "gamma") ?? _gamma;
+                _gamma = ReadNestedNullableDecimal(payload, "greeks", "gamma") ?? _gamma;
                 _vega = ReadNullableDecimal(payload, "vega") ?? _vega;
+                _vega = ReadNestedNullableDecimal(payload, "greeks", "vega") ?? _vega;
                 _theta = ReadNullableDecimal(payload, "theta") ?? _theta;
+                _theta = ReadNestedNullableDecimal(payload, "greeks", "theta") ?? _theta;
                 _change24h = ReadNullableDecimal(payload, "change24h") ?? _change24h;
+                _change24h = ReadNestedNullableDecimal(payload, "stats", "price_change") ?? _change24h;
                 _lastUpdateUtc = eventTimestampUtc;
             }
         }

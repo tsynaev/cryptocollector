@@ -34,7 +34,7 @@ public sealed class BybitCollectorHostedService(
                         _options.QuoteAsset,
                         stoppingToken);
 
-                    instrumentCatalog.Replace(instruments);
+                    instrumentCatalog.Replace(Exchange, instruments);
                     logger.LogInformation("Loaded {Count} tracked Bybit instruments.", instruments.Count);
                 }
                 catch (Exception exception) when (instrumentCatalog.All.Count > 0)
@@ -68,8 +68,8 @@ public sealed class BybitCollectorHostedService(
     private async Task RunSubscriptionsUntilRefreshAsync(CancellationToken stoppingToken)
     {
         var subscriptions = new List<UpdateSubscription>();
-        var linearInstruments = instrumentCatalog.GetByCategory("linear");
-        var optionInstruments = instrumentCatalog.GetByCategory("option");
+        var linearInstruments = instrumentCatalog.GetByCategory(Exchange, "linear");
+        var optionInstruments = instrumentCatalog.GetByCategory(Exchange, "option");
 
         try
         {
@@ -80,7 +80,7 @@ public sealed class BybitCollectorHostedService(
                         chunk,
                         update =>
                         {
-                            if (instrumentCatalog.TryGet(update.Data.Symbol, out var instrument) && instrument is not null)
+                            if (instrumentCatalog.TryGet(Exchange, update.Data.Symbol, out var instrument) && instrument is not null)
                             {
                                 marketDataSink.IngestTicker(instrument, update.Data, DateTimeOffset.UtcNow);
                             }
@@ -94,7 +94,7 @@ public sealed class BybitCollectorHostedService(
                         {
                             foreach (var trade in update.Data)
                             {
-                                if (instrumentCatalog.TryGet(trade.Symbol, out var instrument) && instrument is not null)
+                                if (instrumentCatalog.TryGet(Exchange, trade.Symbol, out var instrument) && instrument is not null)
                                 {
                                     marketDataSink.IngestTrade(instrument, trade);
                                 }
@@ -110,7 +110,7 @@ public sealed class BybitCollectorHostedService(
                         chunk,
                         update =>
                         {
-                            if (instrumentCatalog.TryGet(update.Data.Symbol, out var instrument) && instrument is not null)
+                            if (instrumentCatalog.TryGet(Exchange, update.Data.Symbol, out var instrument) && instrument is not null)
                             {
                                 marketDataSink.IngestTicker(instrument, update.Data, DateTimeOffset.UtcNow);
                             }
@@ -125,7 +125,7 @@ public sealed class BybitCollectorHostedService(
                     {
                         foreach (var trade in update.Data)
                         {
-                            if (instrumentCatalog.TryGet(trade.Symbol, out var instrument) && instrument is not null)
+                            if (instrumentCatalog.TryGet(Exchange, trade.Symbol, out var instrument) && instrument is not null)
                             {
                                 marketDataSink.IngestTrade(instrument, trade);
                             }
@@ -154,7 +154,7 @@ public sealed class BybitCollectorHostedService(
 
     private async Task BootstrapLinearTickersAsync(CancellationToken cancellationToken)
     {
-        var trackedSymbols = instrumentCatalog.GetByCategory("linear")
+        var trackedSymbols = instrumentCatalog.GetByCategory(Exchange, "linear")
             .ToDictionary(static x => x.Symbol, StringComparer.OrdinalIgnoreCase);
 
         var tickers = await apiClient.GetLinearTickersAsync(_options.BaseAsset, cancellationToken);
@@ -171,7 +171,7 @@ public sealed class BybitCollectorHostedService(
 
     private async Task BootstrapOptionTickersAsync(CancellationToken cancellationToken)
     {
-        var trackedSymbols = instrumentCatalog.GetByCategory("option")
+        var trackedSymbols = instrumentCatalog.GetByCategory(Exchange, "option")
             .ToDictionary(static x => x.Symbol, StringComparer.OrdinalIgnoreCase);
 
         var tickers = await apiClient.GetOptionTickersAsync(_options.BaseAsset, cancellationToken);
@@ -188,7 +188,7 @@ public sealed class BybitCollectorHostedService(
 
     private async Task BootstrapLinearTradesAsync(CancellationToken cancellationToken)
     {
-        foreach (var instrument in instrumentCatalog.GetByCategory("linear"))
+        foreach (var instrument in instrumentCatalog.GetByCategory(Exchange, "linear"))
         {
             var trades = await apiClient.GetRecentLinearTradesAsync(instrument.Symbol, cancellationToken);
             foreach (var trade in trades)
@@ -200,7 +200,7 @@ public sealed class BybitCollectorHostedService(
 
     private async Task BootstrapOptionTradesAsync(CancellationToken cancellationToken)
     {
-        var trackedSymbols = instrumentCatalog.GetByCategory("option")
+        var trackedSymbols = instrumentCatalog.GetByCategory(Exchange, "option")
             .ToDictionary(static x => x.Symbol, StringComparer.OrdinalIgnoreCase);
 
         var trades = await apiClient.GetRecentOptionTradesAsync(_options.BaseAsset, cancellationToken);
