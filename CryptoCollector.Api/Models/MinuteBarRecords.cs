@@ -27,8 +27,55 @@ public sealed class TradeRecord : ITimeSeriesRecord
     public decimal Quantity { get; set; }
     public decimal Notional { get; set; }
     public bool IsBlockTrade { get; set; }
+    public string? BlockTradeId { get; set; }
     public bool IsRpiTrade { get; set; }
     public string? Sequence { get; set; }
+}
+
+public sealed class LegacyTradeRecordV1 : ITimeSeriesRecord
+{
+    public string Exchange { get; set; } = string.Empty;
+    public string Symbol { get; set; } = string.Empty;
+    public string MarketType { get; set; } = string.Empty;
+    public string BaseAsset { get; set; } = string.Empty;
+    public string QuoteAsset { get; set; } = string.Empty;
+    public string SettleAsset { get; set; } = string.Empty;
+    public DateTime Date { get; set; }
+    public DateTime? ExpiryUtc { get; set; }
+    public decimal? StrikePrice { get; set; }
+    public string? OptionSide { get; set; }
+    public string TradeId { get; set; } = string.Empty;
+    public string Side { get; set; } = string.Empty;
+    public decimal Price { get; set; }
+    public decimal Quantity { get; set; }
+    public decimal Notional { get; set; }
+    public bool IsBlockTrade { get; set; }
+    public bool IsRpiTrade { get; set; }
+    public string? Sequence { get; set; }
+
+    public TradeRecord Upgrade() =>
+        new()
+        {
+            Exchange = Exchange,
+            Symbol = Symbol,
+            MarketType = MarketType,
+            BaseAsset = BaseAsset,
+            QuoteAsset = QuoteAsset,
+            SettleAsset = SettleAsset,
+            Date = Date,
+            ExpiryUtc = ExpiryUtc,
+            StrikePrice = StrikePrice,
+            OptionSide = OptionSide,
+            TradeId = TradeId,
+            Side = Side,
+            Price = Price,
+            Quantity = Quantity,
+            Notional = Notional,
+            IsBlockTrade = IsBlockTrade,
+            BlockTradeId = null,
+            IsRpiTrade = IsRpiTrade,
+            Sequence = Sequence
+        };
 }
 
 public sealed class TickerMinuteBar : ITimeSeriesRecord

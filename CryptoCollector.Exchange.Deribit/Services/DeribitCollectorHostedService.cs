@@ -232,6 +232,7 @@ public sealed class DeribitCollectorHostedService(
             Price = trade.Price.ToString(System.Globalization.CultureInfo.InvariantCulture),
             TradeId = trade.TradeId,
             IsBlockTrade = !string.IsNullOrWhiteSpace(trade.BlockTradeId),
+            BlockTradeId = trade.BlockTradeId,
             IsRpiTrade = false,
             Sequence = trade.TradeSequence.ToString(System.Globalization.CultureInfo.InvariantCulture)
         };

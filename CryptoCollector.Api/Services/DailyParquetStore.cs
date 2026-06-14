@@ -39,11 +39,20 @@ public sealed class DailyParquetStore(IOptions<StorageOptions> options)
                 Append = File.Exists(filePath)
             };
 
-            await ParquetSerializer.SerializeAsync(
-                group.OrderBy(static x => x.Date).ThenBy(static x => x.Symbol, StringComparer.OrdinalIgnoreCase),
-                filePath,
-                writeOptions,
-                cancellationToken: cancellationToken);
+            var orderedRows = group.OrderBy(static x => x.Date).ThenBy(static x => x.Symbol, StringComparer.OrdinalIgnoreCase).ToArray();
+
+            try
+            {
+                await ParquetSerializer.SerializeAsync(
+                    orderedRows,
+                    filePath,
+                    writeOptions,
+                    cancellationToken: cancellationToken);
+            }
+            catch (ParquetException) when (File.Exists(filePath))
+            {
+                await MigrateAndRewriteAsync(filePath, orderedRows, cancellationToken);
+            }
         }
     }
 
@@ -70,12 +79,7 @@ public sealed class DailyParquetStore(IOptions<StorageOptions> options)
             var filePath = Path.Combine(directory, $"{current:yyyy-MM-dd}.parquet");
             if (File.Exists(filePath))
             {
-                var rows = await ParquetSerializer.DeserializeAsync<T>(
-                    filePath,
-                    _parquetOptions,
-                    cancellationToken: cancellationToken);
-
-                foreach (var row in rows.Data)
+                foreach (var row in await ReadRowsAsync<T>(filePath, cancellationToken))
                 {
                     if (row.Date < fromUtc || row.Date > toUtc)
                     {
@@ -122,12 +126,7 @@ public sealed class DailyParquetStore(IOptions<StorageOptions> options)
 
         foreach (var filePath in files)
         {
-            var rows = await ParquetSerializer.DeserializeAsync<T>(
-                filePath,
-                _parquetOptions,
-                cancellationToken: cancellationToken);
-
-            foreach (var row in rows.Data)
+            foreach (var row in await ReadRowsAsync<T>(filePath, cancellationToken))
             {
                 if (!string.IsNullOrWhiteSpace(symbol) && !row.Symbol.Equals(symbol, StringComparison.OrdinalIgnoreCase))
                 {
@@ -163,5 +162,61 @@ public sealed class DailyParquetStore(IOptions<StorageOptions> options)
             .OrderBy(static x => x.Date)
             .ThenBy(static x => x.Symbol, StringComparer.OrdinalIgnoreCase)
             .ToArray();
+    }
+
+    private async Task<IReadOnlyList<T>> ReadRowsAsync<T>(string filePath, CancellationToken cancellationToken)
+        where T : class, ITimeSeriesRecord, new()
+    {
+        try
+        {
+            var rows = await ParquetSerializer.DeserializeAsync<T>(
+                filePath,
+                _parquetOptions,
+                cancellationToken: cancellationToken);
+
+            return rows.Data.ToArray();
+        }
+        catch (ParquetException) when (typeof(T) == typeof(TradeRecord))
+        {
+            var legacyRows = await ParquetSerializer.DeserializeAsync<LegacyTradeRecordV1>(
+                filePath,
+                _parquetOptions,
+                cancellationToken: cancellationToken);
+
+            return legacyRows.Data
+                .Select(static x => (T)(ITimeSeriesRecord)x.Upgrade())
+                .ToArray();
+        }
+    }
+
+    private async Task MigrateAndRewriteAsync<T>(string filePath, IReadOnlyCollection<T> newRows, CancellationToken cancellationToken)
+        where T : class, ITimeSeriesRecord
+    {
+        if (typeof(T) != typeof(TradeRecord))
+        {
+            throw new ParquetException($"Schema migration is not implemented for {typeof(T).Name}.");
+        }
+
+        var legacyRows = await ParquetSerializer.DeserializeAsync<LegacyTradeRecordV1>(
+            filePath,
+            _parquetOptions,
+            cancellationToken: cancellationToken);
+
+        var mergedRows = legacyRows.Data
+            .Select(static x => x.Upgrade())
+            .Concat(newRows.Cast<TradeRecord>())
+            .OrderBy(static x => x.Date)
+            .ThenBy(static x => x.Symbol, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        await ParquetSerializer.SerializeAsync(
+            mergedRows,
+            filePath,
+            new ParquetOptions
+            {
+                CompressionMethod = _parquetOptions.CompressionMethod,
+                Append = false
+            },
+            cancellationToken: cancellationToken);
     }
 }

@@ -63,6 +63,7 @@ public sealed class MinuteAggregationService(
             Quantity = quantity,
             Notional = price * quantity,
             IsBlockTrade = trade.IsBlockTrade,
+            BlockTradeId = trade.BlockTradeId,
             IsRpiTrade = trade.IsRpiTrade,
             Sequence = trade.Sequence
         });
@@ -79,6 +80,7 @@ public sealed class MinuteAggregationService(
             Price = trade.Price.ToString(CultureInfo.InvariantCulture),
             TradeId = trade.TradeId,
             IsBlockTrade = trade.IsBlockTrade ?? false,
+            BlockTradeId = null,
             IsRpiTrade = trade.IsRpiTrade ?? false,
             Sequence = (trade.Sequence ?? 0).ToString(CultureInfo.InvariantCulture)
         });
@@ -95,6 +97,7 @@ public sealed class MinuteAggregationService(
             Price = trade.Price.ToString(CultureInfo.InvariantCulture),
             TradeId = trade.TradeId,
             IsBlockTrade = trade.IsBlockTrade,
+            BlockTradeId = null,
             IsRpiTrade = trade.IsRpiTrade ?? false,
             Sequence = (trade.Sequence ?? 0).ToString(CultureInfo.InvariantCulture)
         });
@@ -111,6 +114,7 @@ public sealed class MinuteAggregationService(
             Price = trade.Price.ToString(CultureInfo.InvariantCulture),
             TradeId = trade.TradeId,
             IsBlockTrade = trade.IsBlockTrade ?? false,
+            BlockTradeId = null,
             IsRpiTrade = trade.IsRpiTrade ?? false,
             Sequence = (trade.Sequence ?? 0).ToString(CultureInfo.InvariantCulture)
         });
