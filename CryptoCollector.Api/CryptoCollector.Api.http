@@ -1,0 +1,6 @@
+@CryptoCollector.Api_HostAddress = http://localhost:5298
+
+GET {{CryptoCollector.Api_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
