@@ -63,6 +63,6 @@ jobs:
           script: |
             set -e
             cd "${{ secrets.DEPLOY_PATH }}"
-            docker compose pull
-            docker compose up -d --remove-orphans
+            /usr/local/bin/docker compose pull
+            /usr/local/bin/docker compose up -d --remove-orphans
 
