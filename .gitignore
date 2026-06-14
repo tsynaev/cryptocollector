@@ -5,3 +5,6 @@ data/
 *.user
 _inspect_bybit/
 .vs/
+_publish_test/
+_temp/
+tmp/
