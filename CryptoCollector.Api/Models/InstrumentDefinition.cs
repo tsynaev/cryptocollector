@@ -8,7 +8,7 @@ namespace CryptoCollector.Api.Models;
 public sealed class InstrumentDefinition
 {
     private static readonly Regex OptionSymbolRegex = new(
-        "^(?<base>[A-Z]+)-(?<expiry>\\d{1,2}[A-Z]{3}\\d{2})-(?<strike>\\d+(?:\\.\\d+)?)-(?<type>[CP])$",
+        "^(?<base>[A-Z]+)-(?<expiry>\\d{1,2}[A-Z]{3}\\d{2})-(?<strike>\\d+(?:\\.\\d+)?)-(?<type>[CP])(?:-(?<settle>[A-Z]+))?$",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     public required string Exchange { get; init; }
