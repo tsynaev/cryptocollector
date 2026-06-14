@@ -1,3 +1,5 @@
+using CryptoCollector.API.Exchange.Models;
+
 namespace CryptoCollector.Api.Models;
 
 public interface ITimeSeriesRecord

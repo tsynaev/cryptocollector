@@ -1,27 +1,23 @@
-using Bybit.Net.Clients;
+using CryptoCollector.API.Exchange.Services;
 using CryptoCollector.Api.Models;
 using CryptoCollector.Api.Options;
 using CryptoCollector.Api.Services;
+using CryptoCollector.Exchange.Bybit;
 
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.Configure<StorageOptions>(builder.Configuration.GetSection(StorageOptions.SectionName));
-builder.Services.Configure<BybitCollectorOptions>(builder.Configuration.GetSection(BybitCollectorOptions.SectionName));
 
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddOpenApi();
 builder.Services.AddSwaggerGen();
-
-builder.Services.AddSingleton(_ => new BybitRestClient());
-builder.Services.AddSingleton(_ => new BybitSocketClient());
-builder.Services.AddSingleton<BybitApiClient>();
 
 builder.Services.AddSingleton<InstrumentCatalog>();
 builder.Services.AddSingleton<DailyParquetStore>();
 builder.Services.AddSingleton<MinuteAggregationService>();
 builder.Services.AddSingleton<IMarketDataSink>(sp => sp.GetRequiredService<MinuteAggregationService>());
 builder.Services.AddHostedService(sp => sp.GetRequiredService<MinuteAggregationService>());
-builder.Services.AddHostedService<BybitCollectorHostedService>();
+builder.Services.AddBybitExchange(builder.Configuration);
 
 var app = builder.Build();
 

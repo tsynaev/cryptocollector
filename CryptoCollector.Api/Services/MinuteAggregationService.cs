@@ -2,26 +2,15 @@ using System.Collections.Concurrent;
 using System.Globalization;
 using System.Text.Json;
 using Bybit.Net.Objects.Models.V5;
+using CryptoCollector.API.Exchange.Models;
+using CryptoCollector.API.Exchange.Services;
 using CryptoCollector.Api.Models;
-using CryptoCollector.Api.Options;
+using CryptoCollector.Exchange.Bybit.Options;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 namespace CryptoCollector.Api.Services;
-
-public interface IMarketDataSink
-{
-    void IngestTrade(InstrumentDefinition instrument, BybitRecentTrade trade);
-    void IngestTicker(InstrumentDefinition instrument, JsonElement payload, DateTimeOffset eventTimestamp);
-    void IngestTrade(InstrumentDefinition instrument, BybitTrade trade);
-    void IngestTrade(InstrumentDefinition instrument, BybitTradeHistory trade);
-    void IngestTrade(InstrumentDefinition instrument, BybitOptionTrade trade);
-    void IngestTicker(InstrumentDefinition instrument, BybitLinearTickerUpdate payload, DateTimeOffset eventTimestamp);
-    void IngestTicker(InstrumentDefinition instrument, BybitLinearInverseTicker payload, DateTimeOffset eventTimestamp);
-    void IngestTicker(InstrumentDefinition instrument, BybitOptionTickerUpdate payload, DateTimeOffset eventTimestamp);
-    void IngestTicker(InstrumentDefinition instrument, BybitOptionTicker payload, DateTimeOffset eventTimestamp);
-}
 
 public sealed class MinuteAggregationService(
     DailyParquetStore store,
@@ -35,7 +24,7 @@ public sealed class MinuteAggregationService(
     private DateTime? _lastReportedMinute;
     private readonly decimal _minTradeQuantity = options.Value.MinTradeQuantity;
 
-    public void IngestTrade(InstrumentDefinition instrument, BybitRecentTrade trade)
+    public void IngestTrade(InstrumentDefinition instrument, ExchangeTrade trade)
     {
         var timestamp = DateTimeOffset.FromUnixTimeMilliseconds(trade.TradeTime).UtcDateTime;
         if (!decimal.TryParse(trade.Price, NumberStyles.Any, CultureInfo.InvariantCulture, out var price) ||
@@ -81,7 +70,7 @@ public sealed class MinuteAggregationService(
 
     public void IngestTrade(InstrumentDefinition instrument, BybitTrade trade)
     {
-        IngestTrade(instrument, new BybitRecentTrade
+        IngestTrade(instrument, new ExchangeTrade
         {
             TradeTime = new DateTimeOffset(trade.Timestamp).ToUnixTimeMilliseconds(),
             Symbol = trade.Symbol,
@@ -97,7 +86,7 @@ public sealed class MinuteAggregationService(
 
     public void IngestTrade(InstrumentDefinition instrument, BybitTradeHistory trade)
     {
-        IngestTrade(instrument, new BybitRecentTrade
+        IngestTrade(instrument, new ExchangeTrade
         {
             TradeTime = new DateTimeOffset(trade.Timestamp).ToUnixTimeMilliseconds(),
             Symbol = trade.Symbol,
@@ -113,7 +102,7 @@ public sealed class MinuteAggregationService(
 
     public void IngestTrade(InstrumentDefinition instrument, BybitOptionTrade trade)
     {
-        IngestTrade(instrument, new BybitRecentTrade
+        IngestTrade(instrument, new ExchangeTrade
         {
             TradeTime = new DateTimeOffset(trade.Timestamp).ToUnixTimeMilliseconds(),
             Symbol = trade.Symbol,

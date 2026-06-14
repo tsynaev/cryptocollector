@@ -1,7 +1,7 @@
 using System.Collections.Immutable;
-using CryptoCollector.Api.Models;
+using CryptoCollector.API.Exchange.Models;
 
-namespace CryptoCollector.Api.Services;
+namespace CryptoCollector.API.Exchange.Services;
 
 public sealed class InstrumentCatalog
 {

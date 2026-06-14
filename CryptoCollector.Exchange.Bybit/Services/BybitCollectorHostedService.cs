@@ -1,11 +1,13 @@
 using Bybit.Net.Clients;
-using CryptoCollector.Api.Options;
+using CryptoCollector.API.Exchange.Abstractions;
+using CryptoCollector.API.Exchange.Services;
+using CryptoCollector.Exchange.Bybit.Options;
 using CryptoExchange.Net.Objects.Sockets;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
-namespace CryptoCollector.Api.Services;
+namespace CryptoCollector.Exchange.Bybit.Services;
 
 public sealed class BybitCollectorHostedService(
     BybitApiClient apiClient,
@@ -13,9 +15,11 @@ public sealed class BybitCollectorHostedService(
     InstrumentCatalog instrumentCatalog,
     IMarketDataSink marketDataSink,
     IOptions<BybitCollectorOptions> options,
-    ILogger<BybitCollectorHostedService> logger) : BackgroundService
+    ILogger<BybitCollectorHostedService> logger) : BackgroundService, IExchangeCollector
 {
     private readonly BybitCollectorOptions _options = options.Value;
+
+    public string Exchange => "bybit";
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {

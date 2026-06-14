@@ -1,4 +1,4 @@
-namespace CryptoCollector.Api.Options;
+namespace CryptoCollector.Exchange.Bybit.Options;
 
 public sealed class BybitCollectorOptions
 {

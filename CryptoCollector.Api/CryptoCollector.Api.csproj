@@ -7,10 +7,14 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Bybit.Net" Version="6.14.0" />
     <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.9" />
     <PackageReference Include="Parquet.Net" Version="6.0.3" />
     <PackageReference Include="Swashbuckle.AspNetCore" Version="10.2.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\CryptoCollector.API.Exchange\CryptoCollector.API.Exchange.csproj" />
+    <ProjectReference Include="..\CryptoCollector.Exchange.Bybit\CryptoCollector.Exchange.Bybit.csproj" />
   </ItemGroup>
 
 </Project>

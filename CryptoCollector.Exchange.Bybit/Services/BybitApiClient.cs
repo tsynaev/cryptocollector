@@ -1,16 +1,25 @@
 using Bybit.Net.Clients;
 using Bybit.Net.Enums;
 using Bybit.Net.Objects.Models.V5;
-using CryptoCollector.Api.Models;
-using CryptoCollector.Api.Options;
+using CryptoCollector.API.Exchange.Abstractions;
+using CryptoCollector.API.Exchange.Models;
+using CryptoCollector.Exchange.Bybit.Options;
 using CryptoExchange.Net.Objects;
 using Microsoft.Extensions.Options;
+using System.Globalization;
+using System.Text.RegularExpressions;
 
-namespace CryptoCollector.Api.Services;
+namespace CryptoCollector.Exchange.Bybit.Services;
 
-public sealed class BybitApiClient(BybitRestClient restClient, IOptions<BybitCollectorOptions> options)
+public sealed class BybitApiClient(BybitRestClient restClient, IOptions<BybitCollectorOptions> options) : IExchangeMarketDataClient
 {
+    private static readonly Regex OptionSymbolRegex = new(
+        "^(?<base>[A-Z]+)-(?<expiry>\\d{1,2}[A-Z]{3}\\d{2})-(?<strike>\\d+(?:\\.\\d+)?)-(?<type>[CP])(?:-(?<settle>[A-Z]+))?$",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
     private readonly BybitCollectorOptions _options = options.Value;
+
+    public string Exchange => "bybit";
 
     public async Task<IReadOnlyList<InstrumentDefinition>> GetTrackedInstrumentsAsync(string baseAsset, string quoteAsset, CancellationToken cancellationToken)
     {
@@ -20,12 +29,12 @@ public sealed class BybitApiClient(BybitRestClient restClient, IOptions<BybitCol
         var options = optionSource
             .Where(x => x.BaseAsset.Equals(baseAsset, StringComparison.OrdinalIgnoreCase))
             .Where(x => x.QuoteAsset.Equals(quoteAsset, StringComparison.OrdinalIgnoreCase))
-            .Select(InstrumentDefinition.FromBybit);
+            .Select(MapOptionInstrument);
 
         var linear = linearSource
             .Where(x => x.BaseAsset.Equals(baseAsset, StringComparison.OrdinalIgnoreCase))
             .Where(x => x.QuoteAsset.Equals(quoteAsset, StringComparison.OrdinalIgnoreCase))
-            .Select(InstrumentDefinition.FromBybit);
+            .Select(MapLinearInstrument);
 
         return options.Concat(linear).ToArray();
     }
@@ -180,5 +189,48 @@ public sealed class BybitApiClient(BybitRestClient restClient, IOptions<BybitCol
         }
 
         throw new InvalidOperationException($"{operation} failed: {lastResult?.Error}");
+    }
+
+    private static InstrumentDefinition MapOptionInstrument(BybitOptionSymbol source) =>
+        new()
+        {
+            Exchange = "bybit",
+            Category = "option",
+            MarketType = "option",
+            Symbol = source.Name,
+            BaseAsset = source.BaseAsset,
+            QuoteAsset = source.QuoteAsset,
+            SettleAsset = source.SettleAsset,
+            ExpiryUtc = source.DeliveryTime,
+            StrikePrice = TryParseOptionStrike(source.Name),
+            OptionSide = source.OptionType == OptionType.Call ? "Call" : "Put"
+        };
+
+    private static InstrumentDefinition MapLinearInstrument(BybitLinearInverseSymbol source) =>
+        new()
+        {
+            Exchange = "bybit",
+            Category = "linear",
+            MarketType = source.ContractType.ToString().Contains("Perpetual", StringComparison.OrdinalIgnoreCase) ? "perpetual" : "future",
+            Symbol = source.Name,
+            BaseAsset = source.BaseAsset,
+            QuoteAsset = source.QuoteAsset,
+            SettleAsset = source.SettleAsset,
+            ExpiryUtc = source.DeliveryTime,
+            StrikePrice = null,
+            OptionSide = null
+        };
+
+    private static decimal? TryParseOptionStrike(string symbol)
+    {
+        var optionMatch = OptionSymbolRegex.Match(symbol);
+        if (!optionMatch.Success)
+        {
+            return null;
+        }
+
+        return decimal.TryParse(optionMatch.Groups["strike"].Value, NumberStyles.Any, CultureInfo.InvariantCulture, out var strikeValue)
+            ? strikeValue
+            : null;
     }
 }
