@@ -120,9 +120,12 @@ app.MapGet("/history/tickers", async (
 
 app.MapGet("/history/option-chain", async (
     string exchange,
-    DateTimeOffset from,
-    DateTimeOffset to,
+    DateTimeOffset? from,
+    DateTimeOffset? to,
     string? symbol,
+    decimal? strike,
+    DateOnly? expireDate,
+    string? optionSide,
     DailyParquetStore store,
     CancellationToken cancellationToken) =>
 {
@@ -131,24 +134,80 @@ app.MapGet("/history/option-chain", async (
         return Results.BadRequest("Unsupported exchange.");
     }
 
-    if (from > to)
+    if (from is not null && to is not null && from > to)
     {
         return Results.BadRequest("'from' must be earlier than or equal to 'to'.");
     }
 
-    var rows = await store.QueryAsync<OptionChainMinuteBar>(
-        exchange,
-        DataSetNames.OptionChain,
-        from.UtcDateTime,
-        to.UtcDateTime,
-        symbol,
-        cancellationToken);
+    if (!string.IsNullOrWhiteSpace(optionSide) &&
+        !optionSide.Equals("call", StringComparison.OrdinalIgnoreCase) &&
+        !optionSide.Equals("put", StringComparison.OrdinalIgnoreCase))
+    {
+        return Results.BadRequest("'optionSide' must be 'call' or 'put'.");
+    }
+
+    bool Predicate(OptionChainMinuteBar row)
+    {
+        if (strike is not null && row.StrikePrice != strike.Value)
+        {
+            return false;
+        }
+
+        if (expireDate is not null)
+        {
+            var rowExpiryDate = row.ExpiryUtc is null ? (DateOnly?)null : DateOnly.FromDateTime(row.ExpiryUtc.Value);
+            if (rowExpiryDate != expireDate.Value)
+            {
+                return false;
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(optionSide) &&
+            !string.Equals(row.OptionSide, optionSide, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    IReadOnlyList<OptionChainMinuteBar> rows;
+
+    if (from is null && to is null)
+    {
+        rows = await store.QueryLatestAsync<OptionChainMinuteBar>(
+            exchange,
+            DataSetNames.OptionChain,
+            symbol,
+            Predicate,
+            cancellationToken);
+    }
+    else
+    {
+        var effectiveTo = to ?? DateTimeOffset.UtcNow;
+        var effectiveFrom = from ?? effectiveTo.AddHours(-24);
+
+        if (effectiveFrom > effectiveTo)
+        {
+            return Results.BadRequest("'from' must be earlier than or equal to 'to'.");
+        }
+
+        rows = await store.QueryAsync<OptionChainMinuteBar>(
+            exchange,
+            DataSetNames.OptionChain,
+            effectiveFrom.UtcDateTime,
+            effectiveTo.UtcDateTime,
+            symbol,
+            cancellationToken);
+
+        rows = rows.Where(Predicate).ToArray();
+    }
 
     return Results.Ok(rows);
 })
 .WithName("GetOptionChainHistory")
 .WithSummary("Get aggregated option-chain snapshots by minute.")
-.WithDescription("Returns one-minute latest option ticker snapshots for option contracts.")
+.WithDescription("Returns one-minute option-chain snapshots. When both 'from' and 'to' are omitted, returns the latest available chain snapshot.")
 .WithTags("History");
 
 app.Run();

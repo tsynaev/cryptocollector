@@ -99,4 +99,69 @@ public sealed class DailyParquetStore(IOptions<StorageOptions> options)
             .ThenBy(static x => x.Symbol, StringComparer.OrdinalIgnoreCase)
             .ToArray();
     }
+
+    public async Task<IReadOnlyList<T>> QueryLatestAsync<T>(
+        string exchange,
+        string dataSet,
+        string? symbol,
+        Func<T, bool>? predicate,
+        CancellationToken cancellationToken) where T : class, ITimeSeriesRecord, new()
+    {
+        var directory = Path.Combine(_dataRoot, exchange.ToLowerInvariant(), dataSet);
+        if (!Directory.Exists(directory))
+        {
+            return [];
+        }
+
+        var files = Directory
+            .EnumerateFiles(directory, "*.parquet", SearchOption.TopDirectoryOnly)
+            .OrderByDescending(static path => path, StringComparer.OrdinalIgnoreCase);
+
+        DateTime? latestDate = null;
+        var results = new List<T>();
+
+        foreach (var filePath in files)
+        {
+            var rows = await ParquetSerializer.DeserializeAsync<T>(
+                filePath,
+                _parquetOptions,
+                cancellationToken: cancellationToken);
+
+            foreach (var row in rows.Data)
+            {
+                if (!string.IsNullOrWhiteSpace(symbol) && !row.Symbol.Equals(symbol, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                if (predicate is not null && !predicate(row))
+                {
+                    continue;
+                }
+
+                if (latestDate is null || row.Date > latestDate.Value)
+                {
+                    latestDate = row.Date;
+                    results.Clear();
+                    results.Add(row);
+                    continue;
+                }
+
+                if (row.Date == latestDate.Value)
+                {
+                    results.Add(row);
+                }
+            }
+
+            if (latestDate is not null)
+            {
+                break;
+            }
+        }
+
+        return results
+            .OrderBy(static x => x.Date)
+            .ThenBy(static x => x.Symbol, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
 }
