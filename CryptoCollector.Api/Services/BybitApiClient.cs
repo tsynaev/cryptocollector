@@ -2,12 +2,16 @@ using Bybit.Net.Clients;
 using Bybit.Net.Enums;
 using Bybit.Net.Objects.Models.V5;
 using CryptoCollector.Api.Models;
+using CryptoCollector.Api.Options;
 using CryptoExchange.Net.Objects;
+using Microsoft.Extensions.Options;
 
 namespace CryptoCollector.Api.Services;
 
-public sealed class BybitApiClient(BybitRestClient restClient)
+public sealed class BybitApiClient(BybitRestClient restClient, IOptions<BybitCollectorOptions> options)
 {
+    private readonly BybitCollectorOptions _options = options.Value;
+
     public async Task<IReadOnlyList<InstrumentDefinition>> GetTrackedInstrumentsAsync(string baseAsset, string quoteAsset, CancellationToken cancellationToken)
     {
         var optionSource = await GetOptionSymbolsAsync(baseAsset, cancellationToken);
@@ -28,49 +32,61 @@ public sealed class BybitApiClient(BybitRestClient restClient)
 
     public async Task<IReadOnlyList<BybitOptionTicker>> GetOptionTickersAsync(string baseAsset, CancellationToken cancellationToken)
     {
-        var result = await restClient.V5Api.ExchangeData.GetOptionTickersAsync(
-            symbol: string.Empty,
-            baseAsset: baseAsset,
-            expirationDate: null,
-            ct: cancellationToken);
+        var result = await ExecuteWithRetryAsync(
+            ct => restClient.V5Api.ExchangeData.GetOptionTickersAsync(
+                symbol: string.Empty,
+                baseAsset: baseAsset,
+                expirationDate: null,
+                ct: ct),
+            "GetOptionTickersAsync",
+            cancellationToken);
 
         return GetData(result, "GetOptionTickersAsync").List;
     }
 
     public async Task<IReadOnlyList<BybitLinearInverseTicker>> GetLinearTickersAsync(string baseAsset, CancellationToken cancellationToken)
     {
-        var result = await restClient.V5Api.ExchangeData.GetLinearInverseTickersAsync(
-            Category.Linear,
-            symbol: string.Empty,
-            baseAsset: baseAsset,
-            expirationDate: null,
-            ct: cancellationToken);
+        var result = await ExecuteWithRetryAsync(
+            ct => restClient.V5Api.ExchangeData.GetLinearInverseTickersAsync(
+                Category.Linear,
+                symbol: string.Empty,
+                baseAsset: baseAsset,
+                expirationDate: null,
+                ct: ct),
+            "GetLinearInverseTickersAsync",
+            cancellationToken);
 
         return GetData(result, "GetLinearInverseTickersAsync").List;
     }
 
     public async Task<IReadOnlyList<BybitTradeHistory>> GetRecentOptionTradesAsync(string baseAsset, CancellationToken cancellationToken)
     {
-        var result = await restClient.V5Api.ExchangeData.GetTradeHistoryAsync(
-            Category.Option,
-            symbol: string.Empty,
-            baseAsset: baseAsset,
-            optionType: null,
-            limit: 1000,
-            ct: cancellationToken);
+        var result = await ExecuteWithRetryAsync(
+            ct => restClient.V5Api.ExchangeData.GetTradeHistoryAsync(
+                Category.Option,
+                symbol: string.Empty,
+                baseAsset: baseAsset,
+                optionType: null,
+                limit: 1000,
+                ct: ct),
+            "GetTradeHistoryAsync(option)",
+            cancellationToken);
 
         return GetData(result, "GetTradeHistoryAsync(option)").List;
     }
 
     public async Task<IReadOnlyList<BybitTradeHistory>> GetRecentLinearTradesAsync(string symbol, CancellationToken cancellationToken)
     {
-        var result = await restClient.V5Api.ExchangeData.GetTradeHistoryAsync(
-            Category.Linear,
-            symbol: symbol,
-            baseAsset: string.Empty,
-            optionType: null,
-            limit: 1000,
-            ct: cancellationToken);
+        var result = await ExecuteWithRetryAsync(
+            ct => restClient.V5Api.ExchangeData.GetTradeHistoryAsync(
+                Category.Linear,
+                symbol: symbol,
+                baseAsset: string.Empty,
+                optionType: null,
+                limit: 1000,
+                ct: ct),
+            $"GetTradeHistoryAsync({symbol})",
+            cancellationToken);
 
         return GetData(result, $"GetTradeHistoryAsync({symbol})").List;
     }
@@ -82,12 +98,15 @@ public sealed class BybitApiClient(BybitRestClient restClient)
 
         do
         {
-            var result = await restClient.V5Api.ExchangeData.GetOptionSymbolsAsync(
-                symbol: null,
-                baseAsset: baseAsset,
-                limit: 1000,
-                cursor: cursor,
-                ct: cancellationToken);
+            var result = await ExecuteWithRetryAsync(
+                ct => restClient.V5Api.ExchangeData.GetOptionSymbolsAsync(
+                    symbol: null,
+                    baseAsset: baseAsset,
+                    limit: 1000,
+                    cursor: cursor,
+                    ct: ct),
+                "GetOptionSymbolsAsync",
+                cancellationToken);
 
             var data = GetData(result, "GetOptionSymbolsAsync");
             results.AddRange(data.List);
@@ -105,15 +124,18 @@ public sealed class BybitApiClient(BybitRestClient restClient)
 
         do
         {
-            var result = await restClient.V5Api.ExchangeData.GetLinearInverseSymbolsAsync(
-                Category.Linear,
-                symbol: null,
-                baseAsset: baseAsset,
-                status: null,
-                symbolType: null,
-                limit: 1000,
-                cursor: cursor,
-                ct: cancellationToken);
+            var result = await ExecuteWithRetryAsync(
+                ct => restClient.V5Api.ExchangeData.GetLinearInverseSymbolsAsync(
+                    Category.Linear,
+                    symbol: null,
+                    baseAsset: baseAsset,
+                    status: null,
+                    symbolType: null,
+                    limit: 1000,
+                    cursor: cursor,
+                    ct: ct),
+                "GetLinearInverseSymbolsAsync",
+                cancellationToken);
 
             var data = GetData(result, "GetLinearInverseSymbolsAsync");
             results.AddRange(data.List);
@@ -132,5 +154,31 @@ public sealed class BybitApiClient(BybitRestClient restClient)
         }
 
         return result.Data;
+    }
+
+    private async Task<WebCallResult<BybitResponse<T>>> ExecuteWithRetryAsync<T>(
+        Func<CancellationToken, Task<WebCallResult<BybitResponse<T>>>> action,
+        string operation,
+        CancellationToken cancellationToken)
+    {
+        WebCallResult<BybitResponse<T>>? lastResult = null;
+
+        for (var attempt = 1; attempt <= _options.RestRetryCount; attempt++)
+        {
+            lastResult = await action(cancellationToken);
+            if (lastResult.Success && lastResult.Data is not null)
+            {
+                return lastResult;
+            }
+
+            if (attempt == _options.RestRetryCount)
+            {
+                break;
+            }
+
+            await Task.Delay(TimeSpan.FromTicks(_options.RestRetryDelay.Ticks * attempt), cancellationToken);
+        }
+
+        throw new InvalidOperationException($"{operation} failed: {lastResult?.Error}");
     }
 }

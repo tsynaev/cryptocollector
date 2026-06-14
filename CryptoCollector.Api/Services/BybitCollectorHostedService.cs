@@ -23,15 +23,30 @@ public sealed class BybitCollectorHostedService(
         {
             try
             {
-                var instruments = await apiClient.GetTrackedInstrumentsAsync(
-                    _options.BaseAsset,
-                    _options.QuoteAsset,
-                    stoppingToken);
+                try
+                {
+                    var instruments = await apiClient.GetTrackedInstrumentsAsync(
+                        _options.BaseAsset,
+                        _options.QuoteAsset,
+                        stoppingToken);
 
-                instrumentCatalog.Replace(instruments);
-                logger.LogInformation("Loaded {Count} tracked Bybit instruments.", instruments.Count);
+                    instrumentCatalog.Replace(instruments);
+                    logger.LogInformation("Loaded {Count} tracked Bybit instruments.", instruments.Count);
+                }
+                catch (Exception exception) when (instrumentCatalog.All.Count > 0)
+                {
+                    logger.LogWarning(exception, "Instrument refresh failed. Reusing cached catalog with {Count} instruments.", instrumentCatalog.All.Count);
+                }
 
-                await BootstrapRestAsync(stoppingToken);
+                try
+                {
+                    await BootstrapRestAsync(stoppingToken);
+                }
+                catch (Exception exception)
+                {
+                    logger.LogWarning(exception, "REST bootstrap failed. Continuing with websocket subscriptions.");
+                }
+
                 await RunSubscriptionsUntilRefreshAsync(stoppingToken);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
