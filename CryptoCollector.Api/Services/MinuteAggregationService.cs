@@ -38,13 +38,13 @@ public sealed class MinuteAggregationService(
             return;
         }
 
-        var dedupeKey = $"{instrument.Symbol}|{trade.TradeId}";
+        var dedupeKey = $"{instrument.Exchange}|{instrument.Symbol}|{trade.TradeId}";
         if (!_seenTradeIds.TryAdd(dedupeKey, timestamp))
         {
             return;
         }
 
-        var key = $"{instrument.Symbol}|{trade.TradeId}|{timestamp:O}";
+        var key = $"{instrument.Exchange}|{instrument.Symbol}|{trade.TradeId}|{timestamp:O}";
         _tradeRows.TryAdd(key, new TradeRecord
         {
             Exchange = instrument.Exchange,
@@ -123,7 +123,7 @@ public sealed class MinuteAggregationService(
     public void IngestTicker(InstrumentDefinition instrument, JsonElement payload, DateTimeOffset eventTimestamp)
     {
         var minute = FloorToMinute(eventTimestamp.UtcDateTime);
-        var key = $"{instrument.Symbol}|{minute:O}";
+        var key = $"{instrument.Exchange}|{instrument.Symbol}|{minute:O}";
 
         if (instrument.MarketType.Equals("option", StringComparison.OrdinalIgnoreCase))
         {
@@ -136,17 +136,37 @@ public sealed class MinuteAggregationService(
         tickerAccumulator.Apply(payload, eventTimestamp.UtcDateTime);
     }
 
-    public void IngestTicker(InstrumentDefinition instrument, BybitLinearTickerUpdate payload, DateTimeOffset eventTimestamp) =>
-        IngestTickerAsJson(instrument, payload, eventTimestamp);
+    public void IngestTicker(InstrumentDefinition instrument, BybitLinearTickerUpdate payload, DateTimeOffset eventTimestamp)
+    {
+        var minute = FloorToMinute(eventTimestamp.UtcDateTime);
+        var key = $"{instrument.Exchange}|{instrument.Symbol}|{minute:O}";
+        var tickerAccumulator = _tickerBars.GetOrAdd(key, _ => new TickerAccumulator(instrument, minute));
+        tickerAccumulator.Apply(payload, eventTimestamp.UtcDateTime);
+    }
 
-    public void IngestTicker(InstrumentDefinition instrument, BybitLinearInverseTicker payload, DateTimeOffset eventTimestamp) =>
-        IngestTickerAsJson(instrument, payload, eventTimestamp);
+    public void IngestTicker(InstrumentDefinition instrument, BybitLinearInverseTicker payload, DateTimeOffset eventTimestamp)
+    {
+        var minute = FloorToMinute(eventTimestamp.UtcDateTime);
+        var key = $"{instrument.Exchange}|{instrument.Symbol}|{minute:O}";
+        var tickerAccumulator = _tickerBars.GetOrAdd(key, _ => new TickerAccumulator(instrument, minute));
+        tickerAccumulator.Apply(payload, eventTimestamp.UtcDateTime);
+    }
 
-    public void IngestTicker(InstrumentDefinition instrument, BybitOptionTickerUpdate payload, DateTimeOffset eventTimestamp) =>
-        IngestTickerAsJson(instrument, payload, eventTimestamp);
+    public void IngestTicker(InstrumentDefinition instrument, BybitOptionTickerUpdate payload, DateTimeOffset eventTimestamp)
+    {
+        var minute = FloorToMinute(eventTimestamp.UtcDateTime);
+        var key = $"{instrument.Exchange}|{instrument.Symbol}|{minute:O}";
+        var accumulator = _optionBars.GetOrAdd(key, _ => new OptionChainAccumulator(instrument, minute));
+        accumulator.Apply(payload, eventTimestamp.UtcDateTime);
+    }
 
-    public void IngestTicker(InstrumentDefinition instrument, BybitOptionTicker payload, DateTimeOffset eventTimestamp) =>
-        IngestTickerAsJson(instrument, payload, eventTimestamp);
+    public void IngestTicker(InstrumentDefinition instrument, BybitOptionTicker payload, DateTimeOffset eventTimestamp)
+    {
+        var minute = FloorToMinute(eventTimestamp.UtcDateTime);
+        var key = $"{instrument.Exchange}|{instrument.Symbol}|{minute:O}";
+        var accumulator = _optionBars.GetOrAdd(key, _ => new OptionChainAccumulator(instrument, minute));
+        accumulator.Apply(payload, eventTimestamp.UtcDateTime);
+    }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -283,35 +303,75 @@ public sealed class MinuteAggregationService(
         IReadOnlyCollection<TickerMinuteBar> tickerRows,
         IReadOnlyCollection<OptionChainMinuteBar> optionRows)
     {
-        var exchanges = tradeRows.Select(static x => x.Exchange)
-            .Concat(tickerRows.Select(static x => x.Exchange))
-            .Concat(optionRows.Select(static x => x.Exchange))
-            .Concat(_tradeRows.Values.Select(static x => x.Exchange))
-            .Concat(_tickerBars.Values.Select(x => x.Exchange))
-            .Concat(_optionBars.Values.Select(x => x.Exchange))
+        var tradeCounts = CountByExchange(tradeRows);
+        var tickerCounts = CountByExchange(tickerRows);
+        var optionCounts = CountByExchange(optionRows);
+        var pendingTradeCounts = CountByExchange(_tradeRows.Values);
+        var pendingTickerCounts = CountByExchange(_tickerBars.Values);
+        var pendingOptionCounts = CountByExchange(_optionBars.Values);
+        var seenTradeCounts = CountSeenTradeIdsByExchange();
+
+        var exchanges = tradeCounts.Keys
+            .Concat(tickerCounts.Keys)
+            .Concat(optionCounts.Keys)
+            .Concat(pendingTradeCounts.Keys)
+            .Concat(pendingTickerCounts.Keys)
+            .Concat(pendingOptionCounts.Keys)
+            .Concat(seenTradeCounts.Keys)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .OrderBy(static x => x, StringComparer.OrdinalIgnoreCase)
             .ToArray();
 
         foreach (var exchange in exchanges)
         {
-            var tradeCount = tradeRows.Count(x => x.Exchange.Equals(exchange, StringComparison.OrdinalIgnoreCase));
-            var tickerCount = tickerRows.Count(x => x.Exchange.Equals(exchange, StringComparison.OrdinalIgnoreCase));
-            var optionCount = optionRows.Count(x => x.Exchange.Equals(exchange, StringComparison.OrdinalIgnoreCase));
-            var pendingTradeCount = _tradeRows.Values.Count(x => x.Exchange.Equals(exchange, StringComparison.OrdinalIgnoreCase));
-            var pendingTickerCount = _tickerBars.Values.Count(x => x.Exchange.Equals(exchange, StringComparison.OrdinalIgnoreCase));
-            var pendingOptionCount = _optionBars.Values.Count(x => x.Exchange.Equals(exchange, StringComparison.OrdinalIgnoreCase));
-            var seenTradeCount = _seenTradeIds.Keys.Count(key => key.StartsWith($"{exchange}|", StringComparison.OrdinalIgnoreCase));
-
             Console.WriteLine(
-                $"[{DateTimeOffset.UtcNow:O}] exchange={exchange} minute={reportedMinute:yyyy-MM-dd HH:mm}Z trades={tradeCount} tickers={tickerCount} optionChain={optionCount} pendingTrades={pendingTradeCount} pendingTickers={pendingTickerCount} pendingOptionChain={pendingOptionCount} seenTradeIds={seenTradeCount}");
+                $"[{DateTimeOffset.UtcNow:O}] exchange={exchange} minute={reportedMinute:yyyy-MM-dd HH:mm}Z trades={tradeCounts.GetValueOrDefault(exchange)} tickers={tickerCounts.GetValueOrDefault(exchange)} optionChain={optionCounts.GetValueOrDefault(exchange)} pendingTrades={pendingTradeCounts.GetValueOrDefault(exchange)} pendingTickers={pendingTickerCounts.GetValueOrDefault(exchange)} pendingOptionChain={pendingOptionCounts.GetValueOrDefault(exchange)} seenTradeIds={seenTradeCounts.GetValueOrDefault(exchange)}");
         }
     }
 
-    private void IngestTickerAsJson<TTicker>(InstrumentDefinition instrument, TTicker payload, DateTimeOffset eventTimestamp)
+    private static Dictionary<string, int> CountByExchange<T>(IEnumerable<T> rows) where T : class
     {
-        using var document = JsonDocument.Parse(JsonSerializer.Serialize(payload));
-        IngestTicker(instrument, document.RootElement.Clone(), eventTimestamp);
+        var counts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var row in rows)
+        {
+            var exchange = row switch
+            {
+                ITimeSeriesRecord timeSeriesRecord => timeSeriesRecord.Exchange,
+                MinuteAccumulatorBase accumulator => accumulator.Exchange,
+                _ => string.Empty
+            };
+
+            if (string.IsNullOrWhiteSpace(exchange))
+            {
+                continue;
+            }
+
+            counts.TryGetValue(exchange, out var count);
+            counts[exchange] = count + 1;
+        }
+
+        return counts;
+    }
+
+    private Dictionary<string, int> CountSeenTradeIdsByExchange()
+    {
+        var counts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var key in _seenTradeIds.Keys)
+        {
+            var separatorIndex = key.IndexOf('|');
+            if (separatorIndex <= 0)
+            {
+                continue;
+            }
+
+            var exchange = key[..separatorIndex];
+            counts.TryGetValue(exchange, out var count);
+            counts[exchange] = count + 1;
+        }
+
+        return counts;
     }
 
     private static decimal? ReadNullableDecimal(JsonElement element, string propertyName)
@@ -441,6 +501,54 @@ public sealed class MinuteAggregationService(
             }
         }
 
+        public void Apply(BybitLinearTickerUpdate payload, DateTime eventTimestampUtc)
+        {
+            lock (_gate)
+            {
+                _lastPrice = payload.LastPrice;
+                _markPrice = payload.MarkPrice;
+                _indexPrice = payload.IndexPrice;
+                _bidPrice = payload.BestBidPrice;
+                _bidSize = payload.BestBidQuantity;
+                _askPrice = payload.BestAskPrice;
+                _askSize = payload.BestAskQuantity;
+                _openInterest = payload.OpenInterest;
+                _openInterestValue = payload.OpenInterestValue ?? _openInterestValue;
+                _volume24h = payload.Volume24h;
+                _turnover24h = payload.Turnover24h;
+                _fundingRate = payload.FundingRate;
+                _basisRate = payload.BasisRate;
+                _basisRateYear = payload.BasisRateYear ?? _basisRateYear;
+                _deliveryUtc = payload.DeliveryTime ?? _deliveryUtc;
+                _nextFundingUtc = payload.NextFundingTime ?? _nextFundingUtc;
+                _lastUpdateUtc = eventTimestampUtc;
+            }
+        }
+
+        public void Apply(BybitLinearInverseTicker payload, DateTime eventTimestampUtc)
+        {
+            lock (_gate)
+            {
+                _lastPrice = payload.LastPrice;
+                _markPrice = payload.MarkPrice;
+                _indexPrice = payload.IndexPrice;
+                _bidPrice = payload.BestBidPrice;
+                _bidSize = payload.BestBidQuantity;
+                _askPrice = payload.BestAskPrice;
+                _askSize = payload.BestAskQuantity;
+                _openInterest = payload.OpenInterest;
+                _openInterestValue = payload.OpenInterestValue ?? _openInterestValue;
+                _volume24h = payload.Volume24h;
+                _turnover24h = payload.Turnover24h;
+                _fundingRate = payload.FundingRate;
+                _basisRate = payload.BasisRate;
+                _basisRateYear = payload.BasisRateYear ?? _basisRateYear;
+                _deliveryUtc = payload.DeliveryTime ?? _deliveryUtc;
+                _nextFundingUtc = payload.NextFundingTime ?? _nextFundingUtc;
+                _lastUpdateUtc = eventTimestampUtc;
+            }
+        }
+
         public TickerMinuteBar Build()
         {
             lock (_gate)
@@ -547,6 +655,64 @@ public sealed class MinuteAggregationService(
                 _theta = ReadNestedNullableDecimal(payload, "greeks", "theta") ?? _theta;
                 _change24h = ReadNullableDecimal(payload, "change24h") ?? _change24h;
                 _change24h = ReadNestedNullableDecimal(payload, "stats", "price_change") ?? _change24h;
+                _lastUpdateUtc = eventTimestampUtc;
+            }
+        }
+
+        public void Apply(BybitOptionTickerUpdate payload, DateTime eventTimestampUtc)
+        {
+            lock (_gate)
+            {
+                _bidPrice = payload.BestBidPrice;
+                _bidSize = payload.BestBidQuantity;
+                _bidIv = payload.BidIv;
+                _askPrice = payload.BestAskPrice;
+                _askSize = payload.BestAskQuantity;
+                _askIv = payload.AskIv;
+                _lastPrice = payload.LastPrice;
+                _markPrice = payload.MarkPrice;
+                _indexPrice = payload.IndexPrice;
+                _markIv = payload.MarkPriceIv;
+                _underlyingPrice = payload.UnderlyingPrice;
+                _openInterest = payload.OpenInterest;
+                _volume24h = payload.Volume24h;
+                _turnover24h = payload.Turnover24h;
+                _totalVolume = payload.TotalVolume;
+                _totalTurnover = payload.TotalTurnover;
+                _delta = payload.Delta;
+                _gamma = payload.Gamma;
+                _vega = payload.Vega;
+                _theta = payload.Theta;
+                _change24h = payload.Change24h;
+                _lastUpdateUtc = eventTimestampUtc;
+            }
+        }
+
+        public void Apply(BybitOptionTicker payload, DateTime eventTimestampUtc)
+        {
+            lock (_gate)
+            {
+                _bidPrice = payload.BestBidPrice;
+                _bidSize = payload.BestBidQuantity;
+                _bidIv = payload.BestBidIv;
+                _askPrice = payload.BestAskPrice;
+                _askSize = payload.BestAskQuantity;
+                _askIv = payload.BestAskIv;
+                _lastPrice = payload.LastPrice;
+                _markPrice = payload.MarkPrice;
+                _indexPrice = payload.IndexPrice;
+                _markIv = payload.MarkIv;
+                _underlyingPrice = payload.UnderlyingPrice;
+                _openInterest = payload.OpenInterest;
+                _volume24h = payload.Volume24h;
+                _turnover24h = payload.Turnover24h;
+                _totalVolume = payload.TotalVolume;
+                _totalTurnover = payload.TotalTurnover;
+                _delta = payload.Delta;
+                _gamma = payload.Gamma;
+                _vega = payload.Vega;
+                _theta = payload.Theta;
+                _change24h = payload.Change24h;
                 _lastUpdateUtc = eventTimestampUtc;
             }
         }
