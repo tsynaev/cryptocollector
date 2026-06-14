@@ -1,7 +1,13 @@
 using Bybit.Net.Clients;
+using Bybit.Net.Objects.Options;
 using CryptoCollector.Api.Models;
 using CryptoCollector.Api.Options;
 using CryptoCollector.Api.Services;
+using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
+using System.IO.Compression;
+using System.Net;
+using System.Net.Sockets;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -12,7 +18,45 @@ builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddOpenApi();
 builder.Services.AddSwaggerGen();
 
-builder.Services.AddSingleton(_ => new BybitRestClient());
+builder.Services.AddSingleton(static _ =>
+{
+    var handler = new SocketsHttpHandler
+    {
+        AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate | DecompressionMethods.Brotli,
+        ConnectCallback = static async (context, cancellationToken) =>
+        {
+            var addresses = await Dns.GetHostAddressesAsync(context.DnsEndPoint.Host, cancellationToken);
+            var orderedAddresses = addresses
+                .OrderByDescending(static x => x.AddressFamily == AddressFamily.InterNetwork)
+                .ToArray();
+
+            Exception? lastException = null;
+
+            foreach (var address in orderedAddresses)
+            {
+                var socket = new Socket(address.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+
+                try
+                {
+                    await socket.ConnectAsync(new IPEndPoint(address, context.DnsEndPoint.Port), cancellationToken);
+                    return new NetworkStream(socket, ownsSocket: true);
+                }
+                catch (Exception exception)
+                {
+                    lastException = exception;
+                    socket.Dispose();
+                }
+            }
+
+            throw lastException ?? new SocketException((int)SocketError.HostNotFound);
+        }
+    };
+
+    return new BybitRestClient(
+        new HttpClient(handler, disposeHandler: true),
+        NullLoggerFactory.Instance,
+        Microsoft.Extensions.Options.Options.Create(new BybitRestOptions()));
+});
 builder.Services.AddSingleton(_ => new BybitSocketClient());
 builder.Services.AddSingleton<BybitApiClient>();
 
