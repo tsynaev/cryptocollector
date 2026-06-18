@@ -10,24 +10,40 @@ using CryptoCollector.Exchange.Deribit;
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.Configure<StorageOptions>(builder.Configuration.GetSection(StorageOptions.SectionName));
+builder.Services.Configure<TelegramOptions>(builder.Configuration.GetSection(TelegramOptions.SectionName));
+builder.Services.Configure<BlockTradesAlertOptions>(builder.Configuration.GetSection(BlockTradesAlertOptions.SectionName));
 
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddOpenApi();
 builder.Services.AddSwaggerGen();
 
 builder.Services.AddSingleton<DailyParquetStore>();
+builder.Services.AddSingleton<ServiceStateStore>();
+builder.Services.AddHttpClient(nameof(TelegramMessageQueue));
+builder.Services.AddSingleton<TelegramMessageQueue>();
+builder.Services.AddSingleton<IMessageQueue>(sp => sp.GetRequiredService<TelegramMessageQueue>());
+builder.Services.AddHostedService(sp => sp.GetRequiredService<TelegramMessageQueue>());
+builder.Services.AddSingleton<BlockTradeAlertService>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<BlockTradeAlertService>());
 builder.Services.AddSingleton<MinuteAggregationService>();
-builder.Services.AddSingleton<IMarketDataSink>(sp => sp.GetRequiredService<MinuteAggregationService>());
+builder.Services.AddSingleton<IMarketDataSink, CompositeMarketDataSink>();
+builder.Services.AddSingleton<IFlushableMarketDataSink>(sp => (CompositeMarketDataSink)sp.GetRequiredService<IMarketDataSink>());
 builder.Services.AddHostedService(sp => sp.GetRequiredService<MinuteAggregationService>());
 builder.Services.AddBybitExchange(builder.Configuration);
 builder.Services.AddDeribitExchange(builder.Configuration);
 builder.Services.AddSingleton<IHostedService>(sp => new ExchangeCollectorService(
     sp.GetRequiredService<BybitExchange>(),
+    sp.GetRequiredService<DailyParquetStore>(),
     sp.GetRequiredService<IMarketDataSink>(),
+    sp.GetRequiredService<IFlushableMarketDataSink>(),
+    sp.GetRequiredService<BlockTradeAlertService>(),
     sp.GetRequiredService<ILogger<ExchangeCollectorService>>()));
 builder.Services.AddSingleton<IHostedService>(sp => new ExchangeCollectorService(
     sp.GetRequiredService<DeribitExchange>(),
+    sp.GetRequiredService<DailyParquetStore>(),
     sp.GetRequiredService<IMarketDataSink>(),
+    sp.GetRequiredService<IFlushableMarketDataSink>(),
+    sp.GetRequiredService<BlockTradeAlertService>(),
     sp.GetRequiredService<ILogger<ExchangeCollectorService>>()));
 
 var app = builder.Build();

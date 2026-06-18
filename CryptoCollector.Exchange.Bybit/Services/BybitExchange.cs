@@ -6,7 +6,6 @@ using CryptoCollector.Exchange.Bybit.Options;
 using CryptoExchange.Net.Objects.Sockets;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
-using System.Globalization;
 using System.Runtime.CompilerServices;
 using System.Threading.Channels;
 
@@ -27,12 +26,12 @@ public sealed class BybitExchange(
     public Task<IReadOnlyList<InstrumentDefinition>> GetTrackedInstrumentsAsync(CancellationToken cancellationToken) =>
         apiClient.GetTrackedInstrumentsAsync(_options.BaseAsset, _options.QuoteAsset, cancellationToken);
 
-    public async Task<ExchangeBootstrapBatch> BootstrapAsync(IReadOnlyList<InstrumentDefinition> instruments, CancellationToken cancellationToken) =>
+    public async Task<ExchangeBootstrapBatch> BootstrapAsync(IReadOnlyList<InstrumentDefinition> instruments, DateTime? catchUpFromUtc, CancellationToken cancellationToken) =>
         new()
         {
             Tickers = await BootstrapLinearTickersAsync(instruments, cancellationToken),
-            Trades = (await BootstrapLinearTradesAsync(instruments, cancellationToken))
-                .Concat(await BootstrapOptionTradesAsync(instruments, cancellationToken))
+            Trades = (await BootstrapLinearTradesAsync(instruments, catchUpFromUtc, cancellationToken))
+                .Concat(await BootstrapOptionTradesAsync(instruments, catchUpFromUtc, cancellationToken))
                 .ToArray()
         };
 
@@ -187,7 +186,7 @@ public sealed class BybitExchange(
         return result;
     }
 
-    private async Task<IReadOnlyList<ExchangeTradeMessage>> BootstrapLinearTradesAsync(IReadOnlyList<InstrumentDefinition> instruments, CancellationToken cancellationToken)
+    private async Task<IReadOnlyList<ExchangeTradeMessage>> BootstrapLinearTradesAsync(IReadOnlyList<InstrumentDefinition> instruments, DateTime? catchUpFromUtc, CancellationToken cancellationToken)
     {
         var result = new List<ExchangeTradeMessage>();
 
@@ -196,6 +195,11 @@ public sealed class BybitExchange(
             var trades = await apiClient.GetRecentLinearTradesAsync(instrument.Symbol, cancellationToken);
             foreach (var trade in trades)
             {
+                if (catchUpFromUtc is not null && trade.Timestamp <= catchUpFromUtc.Value)
+                {
+                    continue;
+                }
+
                 result.Add(new ExchangeTradeMessage(instrument, MapTrade(trade)));
             }
         }
@@ -203,7 +207,7 @@ public sealed class BybitExchange(
         return result;
     }
 
-    private async Task<IReadOnlyList<ExchangeTradeMessage>> BootstrapOptionTradesAsync(IReadOnlyList<InstrumentDefinition> instruments, CancellationToken cancellationToken)
+    private async Task<IReadOnlyList<ExchangeTradeMessage>> BootstrapOptionTradesAsync(IReadOnlyList<InstrumentDefinition> instruments, DateTime? catchUpFromUtc, CancellationToken cancellationToken)
     {
         var trackedSymbols = instruments
             .Where(static x => x.Category.Equals("option", StringComparison.OrdinalIgnoreCase))
@@ -213,6 +217,11 @@ public sealed class BybitExchange(
         var trades = await apiClient.GetRecentOptionTradesAsync(_options.BaseAsset, cancellationToken);
         foreach (var trade in trades)
         {
+            if (catchUpFromUtc is not null && trade.Timestamp <= catchUpFromUtc.Value)
+            {
+                continue;
+            }
+
             if (trackedSymbols.TryGetValue(trade.Symbol, out var instrument))
             {
                 result.Add(new ExchangeTradeMessage(instrument, MapTrade(trade)));
@@ -237,31 +246,31 @@ public sealed class BybitExchange(
     private static ExchangeTrade MapTrade(BybitTrade trade) =>
         new()
         {
-            TradeTime = new DateTimeOffset(trade.Timestamp).ToUnixTimeMilliseconds(),
+            TradeTime = new DateTimeOffset(trade.Timestamp),
             Symbol = trade.Symbol,
             Side = trade.Side.ToString(),
-            Size = trade.Quantity.ToString(CultureInfo.InvariantCulture),
-            Price = trade.Price.ToString(CultureInfo.InvariantCulture),
+            Quantity = trade.Quantity,
+            Price = trade.Price,
             TradeId = trade.TradeId,
             IsBlockTrade = trade.IsBlockTrade ?? false,
             BlockTradeId = null,
             IsRpiTrade = trade.IsRpiTrade ?? false,
-            Sequence = (trade.Sequence ?? 0).ToString(CultureInfo.InvariantCulture)
+            Sequence = (trade.Sequence ?? 0).ToString(System.Globalization.CultureInfo.InvariantCulture)
         };
 
     private static ExchangeTrade MapTrade(BybitTradeHistory trade) =>
         new()
         {
-            TradeTime = new DateTimeOffset(trade.Timestamp).ToUnixTimeMilliseconds(),
+            TradeTime = new DateTimeOffset(trade.Timestamp),
             Symbol = trade.Symbol,
             Side = trade.Side.ToString(),
-            Size = trade.Quantity.ToString(CultureInfo.InvariantCulture),
-            Price = trade.Price.ToString(CultureInfo.InvariantCulture),
+            Quantity = trade.Quantity,
+            Price = trade.Price,
             TradeId = trade.TradeId,
             IsBlockTrade = trade.IsBlockTrade,
             BlockTradeId = null,
             IsRpiTrade = trade.IsRpiTrade ?? false,
-            Sequence = (trade.Sequence ?? 0).ToString(CultureInfo.InvariantCulture)
+            Sequence = (trade.Sequence ?? 0).ToString(System.Globalization.CultureInfo.InvariantCulture)
         };
 
 }

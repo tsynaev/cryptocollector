@@ -1,6 +1,7 @@
 using CryptoCollector.API.Exchange.Abstractions;
 using CryptoCollector.API.Exchange.Models;
 using CryptoCollector.API.Exchange.Services;
+using CryptoCollector.Api.Models;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
@@ -8,7 +9,10 @@ namespace CryptoCollector.Api.Services;
 
 public sealed class ExchangeCollectorService(
     IExchange exchange,
+    DailyParquetStore store,
     IMarketDataSink marketDataSink,
+    IFlushableMarketDataSink flushableMarketDataSink,
+    BlockTradeAlertService blockTradeAlertService,
     ILogger<ExchangeCollectorService> logger) : BackgroundService
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -41,8 +45,21 @@ public sealed class ExchangeCollectorService(
 
                 try
                 {
-                    var bootstrap = await exchange.BootstrapAsync(instruments, stoppingToken);
+                    var latestTradeTimestampUtc = await store.GetLatestTimestampAsync<TradeRecord>(exchange.Name, DataSetNames.Trades, stoppingToken);
+                    var catchUpFromUtc = latestTradeTimestampUtc?.Date;
+
+                    if (catchUpFromUtc is not null)
+                    {
+                        logger.LogInformation(
+                            "{Exchange} bootstrap catch-up starts from {CatchUpDateUtc:yyyy-MM-dd} based on latest persisted trade at {LatestTradeUtc:O}.",
+                            exchange.Name,
+                            catchUpFromUtc.Value,
+                            latestTradeTimestampUtc!.Value);
+                    }
+
+                    var bootstrap = await exchange.BootstrapAsync(instruments, catchUpFromUtc, stoppingToken);
                     FlushBootstrap(bootstrap);
+                    await flushableMarketDataSink.FlushPendingAsync(stoppingToken);
                 }
                 catch (Exception exception)
                 {
@@ -53,6 +70,7 @@ public sealed class ExchangeCollectorService(
                 {
                     var options = await exchange.PollOptionChainSnapshotsAsync(instruments, stoppingToken);
                     FlushOptions(options);
+                    await flushableMarketDataSink.FlushPendingAsync(stoppingToken);
                 }
                 catch (Exception exception)
                 {
@@ -135,9 +153,13 @@ public sealed class ExchangeCollectorService(
 
     private void FlushBootstrap(ExchangeBootstrapBatch bootstrap)
     {
-        foreach (var trade in bootstrap.Trades)
+        foreach (var trade in bootstrap.Trades
+                     .OrderBy(static x => x.Trade.TradeTime)
+                     .ThenBy(static x => x.Instrument.Symbol, StringComparer.OrdinalIgnoreCase)
+                     .ThenBy(static x => x.Trade.TradeId, StringComparer.Ordinal))
         {
             marketDataSink.IngestTrade(trade.Instrument, trade.Trade);
+            blockTradeAlertService.IngestRecoveredTrade(trade.Instrument, trade.Trade);
         }
 
         foreach (var ticker in bootstrap.Tickers)
@@ -162,6 +184,7 @@ public sealed class ExchangeCollectorService(
         {
             case ExchangeTradeMessage trade:
                 marketDataSink.IngestTrade(trade.Instrument, trade.Trade);
+                blockTradeAlertService.IngestLiveTrade(trade.Instrument, trade.Trade);
                 break;
             case ExchangeTickerMessage ticker:
                 marketDataSink.IngestTicker(ticker.Instrument, ticker.Ticker);

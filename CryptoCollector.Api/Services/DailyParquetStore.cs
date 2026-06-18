@@ -164,6 +164,15 @@ public sealed class DailyParquetStore(IOptions<StorageOptions> options)
             .ToArray();
     }
 
+    public async Task<DateTime?> GetLatestTimestampAsync<T>(
+        string exchange,
+        string dataSet,
+        CancellationToken cancellationToken) where T : class, ITimeSeriesRecord, new()
+    {
+        var latest = await QueryLatestAsync<T>(exchange, dataSet, symbol: null, predicate: null, cancellationToken);
+        return latest.Count == 0 ? null : latest.Max(static x => x.Date);
+    }
+
     private async Task<IReadOnlyList<T>> ReadRowsAsync<T>(string filePath, CancellationToken cancellationToken)
         where T : class, ITimeSeriesRecord, new()
     {

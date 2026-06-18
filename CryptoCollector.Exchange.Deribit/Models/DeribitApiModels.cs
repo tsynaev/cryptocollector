@@ -111,6 +111,9 @@ public sealed class DeribitTradeBatch
 {
     [JsonPropertyName("trades")]
     public IReadOnlyList<DeribitTrade> Trades { get; init; } = [];
+
+    [JsonPropertyName("has_more")]
+    public bool HasMore { get; init; }
 }
 
 public sealed class DeribitTrade

@@ -27,8 +27,10 @@ public sealed class DeribitExchange(
     public Task<IReadOnlyList<InstrumentDefinition>> GetTrackedInstrumentsAsync(CancellationToken cancellationToken) =>
         apiClient.GetTrackedInstrumentsAsync(_options.BaseAsset, _options.QuoteAsset, cancellationToken);
 
-    public async Task<ExchangeBootstrapBatch> BootstrapAsync(IReadOnlyList<InstrumentDefinition> instruments, CancellationToken cancellationToken)
+    public async Task<ExchangeBootstrapBatch> BootstrapAsync(IReadOnlyList<InstrumentDefinition> instruments, DateTime? catchUpFromUtc, CancellationToken cancellationToken)
     {
+        var bootstrapFromUtc = catchUpFromUtc ?? DateTime.UtcNow.AddHours(-24);
+        var bootstrapToUtc = DateTime.UtcNow;
         var optionSymbols = instruments
             .Where(static x => x.Category.Equals("option", StringComparison.OrdinalIgnoreCase))
             .ToDictionary(static x => x.Symbol, StringComparer.OrdinalIgnoreCase);
@@ -47,18 +49,28 @@ public sealed class DeribitExchange(
             }
         }
 
-        var optionTrades = await apiClient.GetRecentOptionTradesAsync(_options.BaseAsset, cancellationToken);
+        var optionTrades = await apiClient.GetOptionTradesAsync(_options.BaseAsset, bootstrapFromUtc, bootstrapToUtc, cancellationToken);
         foreach (var trade in optionTrades)
         {
+            if (DateTimeOffset.FromUnixTimeMilliseconds(trade.Timestamp).UtcDateTime < bootstrapFromUtc)
+            {
+                continue;
+            }
+
             if (optionSymbols.TryGetValue(trade.InstrumentName, out var instrument))
             {
                 trades.Add(new ExchangeTradeMessage(instrument, MapTrade(trade)));
             }
         }
 
-        var futureTrades = await apiClient.GetRecentFutureTradesAsync(_options.BaseAsset, cancellationToken);
+        var futureTrades = await apiClient.GetFutureTradesAsync(_options.BaseAsset, bootstrapFromUtc, bootstrapToUtc, cancellationToken);
         foreach (var trade in futureTrades)
         {
+            if (DateTimeOffset.FromUnixTimeMilliseconds(trade.Timestamp).UtcDateTime < bootstrapFromUtc)
+            {
+                continue;
+            }
+
             if (futureSymbols.TryGetValue(trade.InstrumentName, out var instrument))
             {
                 trades.Add(new ExchangeTradeMessage(instrument, MapTrade(trade)));
@@ -385,11 +397,11 @@ public sealed class DeribitExchange(
     private static ExchangeTrade MapTrade(DeribitTrade trade) =>
         new()
         {
-            TradeTime = trade.Timestamp,
+            TradeTime = DateTimeOffset.FromUnixTimeMilliseconds(trade.Timestamp),
             Symbol = trade.InstrumentName,
             Side = trade.Direction,
-            Size = trade.Amount.ToString(System.Globalization.CultureInfo.InvariantCulture),
-            Price = trade.Price.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            Quantity = trade.Contracts ?? trade.Amount,
+            Price = trade.Price,
             TradeId = trade.TradeId,
             IsBlockTrade = !string.IsNullOrWhiteSpace(trade.BlockTradeId),
             BlockTradeId = trade.BlockTradeId,

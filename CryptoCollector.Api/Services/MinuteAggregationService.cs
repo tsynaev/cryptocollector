@@ -1,11 +1,8 @@
 using System.Collections.Concurrent;
-using System.Globalization;
 using CryptoCollector.API.Exchange.Models;
 using CryptoCollector.API.Exchange.Services;
 using CryptoCollector.Api.Models;
 using CryptoCollector.Exchange.Bybit.Options;
-using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 namespace CryptoCollector.Api.Services;
@@ -16,20 +13,19 @@ public sealed class MinuteAggregationService(
     ILogger<MinuteAggregationService> logger) : BackgroundService, IMarketDataSink
 {
     private readonly ConcurrentDictionary<string, TradeRecord> _tradeRows = new(StringComparer.OrdinalIgnoreCase);
-    private readonly ConcurrentDictionary<string, DateTime> _seenTradeIds = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, byte> _seenTradeIds = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentQueue<SeenTradeMarker> _seenTradeIdQueue = new();
     private readonly ConcurrentDictionary<string, TickerAccumulator> _tickerBars = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, OptionChainAccumulator> _optionBars = new(StringComparer.OrdinalIgnoreCase);
     private DateTime? _lastReportedMinute;
     private readonly decimal _minTradeQuantity = options.Value.MinTradeQuantity;
+    private int _seenTradeIdsPreloaded;
 
     public void IngestTrade(InstrumentDefinition instrument, ExchangeTrade trade)
     {
-        var timestamp = DateTimeOffset.FromUnixTimeMilliseconds(trade.TradeTime).UtcDateTime;
-        if (!decimal.TryParse(trade.Price, NumberStyles.Any, CultureInfo.InvariantCulture, out var price) ||
-            !decimal.TryParse(trade.Size, NumberStyles.Any, CultureInfo.InvariantCulture, out var quantity))
-        {
-            return;
-        }
+        var timestamp = trade.TradeTime.UtcDateTime;
+        var price = trade.Price;
+        var quantity = trade.Quantity;
 
         if (quantity < _minTradeQuantity && !trade.IsBlockTrade)
         {
@@ -37,13 +33,14 @@ public sealed class MinuteAggregationService(
         }
 
         var dedupeKey = $"{instrument.Exchange}|{instrument.Symbol}|{trade.TradeId}";
-        if (!_seenTradeIds.TryAdd(dedupeKey, timestamp))
+        if (!_seenTradeIds.TryAdd(dedupeKey, 0))
         {
             return;
         }
+        _seenTradeIdQueue.Enqueue(new SeenTradeMarker(dedupeKey, timestamp));
 
         var key = $"{instrument.Exchange}|{instrument.Symbol}|{trade.TradeId}|{timestamp:O}";
-        _tradeRows.TryAdd(key, new TradeRecord
+        var tradeRecord = new TradeRecord
         {
             Exchange = instrument.Exchange,
             Symbol = instrument.Symbol,
@@ -64,7 +61,9 @@ public sealed class MinuteAggregationService(
             BlockTradeId = trade.BlockTradeId,
             IsRpiTrade = trade.IsRpiTrade,
             Sequence = trade.Sequence
-        });
+        };
+
+        _tradeRows.TryAdd(key, tradeRecord);
     }
 
     public void IngestTicker(InstrumentDefinition instrument, ExchangeTicker ticker)
@@ -85,6 +84,7 @@ public sealed class MinuteAggregationService(
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        await PreloadSeenTradeIdsAsync(stoppingToken);
         using var timer = new PeriodicTimer(TimeSpan.FromSeconds(15));
 
         try
@@ -103,6 +103,45 @@ public sealed class MinuteAggregationService(
     {
         await FlushAsync(includeCurrentMinute: true, cancellationToken);
         await base.StopAsync(cancellationToken);
+    }
+
+    public Task FlushPendingAsync(CancellationToken cancellationToken) =>
+        FlushAsync(includeCurrentMinute: true, cancellationToken);
+
+    private async Task PreloadSeenTradeIdsAsync(CancellationToken cancellationToken)
+    {
+        if (Interlocked.Exchange(ref _seenTradeIdsPreloaded, 1) != 0)
+        {
+            return;
+        }
+
+        foreach (var exchange in new[] { "bybit", "deribit" })
+        {
+            var latestTimestamp = await store.GetLatestTimestampAsync<TradeRecord>(exchange, DataSetNames.Trades, cancellationToken);
+            if (latestTimestamp is null)
+            {
+                continue;
+            }
+
+            var fromUtc = latestTimestamp.Value.Date;
+            var toUtc = fromUtc.AddDays(1).AddTicks(-1);
+            var rows = await store.QueryAsync<TradeRecord>(
+                exchange,
+                DataSetNames.Trades,
+                fromUtc,
+                toUtc,
+                symbol: null,
+                cancellationToken);
+
+            foreach (var row in rows)
+            {
+                var dedupeKey = $"{row.Exchange}|{row.Symbol}|{row.TradeId}";
+                if (_seenTradeIds.TryAdd(dedupeKey, 0))
+                {
+                    _seenTradeIdQueue.Enqueue(new SeenTradeMarker(dedupeKey, row.Date));
+                }
+            }
+        }
     }
 
     private async Task FlushAsync(bool includeCurrentMinute, CancellationToken cancellationToken)
@@ -164,14 +203,14 @@ public sealed class MinuteAggregationService(
 
     private void CleanupSeenTradeIds(DateTime thresholdUtc)
     {
-        foreach (var entry in _seenTradeIds)
+        while (_seenTradeIdQueue.TryPeek(out var marker) && marker.TimestampUtc < thresholdUtc)
         {
-            if (entry.Value >= thresholdUtc)
+            if (!_seenTradeIdQueue.TryDequeue(out marker))
             {
                 continue;
             }
 
-            _seenTradeIds.TryRemove(entry.Key, out _);
+            _seenTradeIds.TryRemove(marker.Key, out _);
         }
     }
 
@@ -288,6 +327,8 @@ public sealed class MinuteAggregationService(
 
         return counts;
     }
+
+    private sealed record SeenTradeMarker(string Key, DateTime TimestampUtc);
 
     private abstract class MinuteAccumulatorBase(InstrumentDefinition instrument, DateTime minute)
     {
