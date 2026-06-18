@@ -17,10 +17,8 @@ public static class ServiceCollectionExtensions
             client.BaseAddress = new Uri(options.RestBaseUrl);
             client.Timeout = TimeSpan.FromSeconds(30);
         });
-        services.AddSingleton<DeribitCollectorHostedService>();
-        services.AddSingleton<IExchangeMarketDataClient>(sp => sp.GetRequiredService<DeribitApiClient>());
-        services.AddSingleton<IExchangeCollector>(sp => sp.GetRequiredService<DeribitCollectorHostedService>());
-        services.AddHostedService(sp => sp.GetRequiredService<DeribitCollectorHostedService>());
+        services.AddSingleton<DeribitExchange>();
+        services.AddSingleton<IExchange>(sp => sp.GetRequiredService<DeribitExchange>());
         return services;
     }
 }

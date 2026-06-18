@@ -5,11 +5,15 @@ using CryptoCollector.API.Exchange.Abstractions;
 using CryptoCollector.API.Exchange.Models;
 using CryptoCollector.Exchange.Deribit.Models;
 using CryptoCollector.Exchange.Deribit.Options;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 namespace CryptoCollector.Exchange.Deribit.Services;
 
-public sealed class DeribitApiClient(HttpClient httpClient, IOptions<DeribitCollectorOptions> options) : IExchangeMarketDataClient
+public sealed class DeribitApiClient(
+    HttpClient httpClient,
+    IOptions<DeribitCollectorOptions> options,
+    ILogger<DeribitApiClient> logger)
 {
     private readonly DeribitCollectorOptions _options = options.Value;
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
@@ -25,13 +29,26 @@ public sealed class DeribitApiClient(HttpClient httpClient, IOptions<DeribitColl
             .Concat(futureInstruments)
             .Where(x => x.IsActive)
             .Where(x => x.BaseCurrency.Equals(baseAsset, StringComparison.OrdinalIgnoreCase))
-            .Where(x => x.QuoteCurrency.Equals(quoteAsset, StringComparison.OrdinalIgnoreCase))
+            .Where(x => MatchesQuoteAsset(x, quoteAsset))
             .Select(MapInstrument)
             .ToArray();
     }
 
     public Task<IReadOnlyList<DeribitBookSummary>> GetOptionSummariesAsync(string baseAsset, CancellationToken cancellationToken) =>
         GetBookSummariesAsync(baseAsset, "option", cancellationToken);
+
+    public async Task<IReadOnlyList<OptionChainSnapshot>> GetOptionChainSnapshotsAsync(CancellationToken cancellationToken)
+    {
+        var timestamp = DateTimeOffset.UtcNow;
+        var summaries = await GetOptionSummariesAsync(_options.BaseAsset, cancellationToken);
+
+        return summaries.Select(summary => new OptionChainSnapshot
+        {
+            Symbol = summary.InstrumentName,
+            Payload = ToJson(summary),
+            TimestampUtc = timestamp
+        }).ToArray();
+    }
 
     public Task<IReadOnlyList<DeribitBookSummary>> GetFutureSummariesAsync(string baseAsset, CancellationToken cancellationToken) =>
         GetBookSummariesAsync(baseAsset, "future", cancellationToken);
@@ -107,16 +124,29 @@ public sealed class DeribitApiClient(HttpClient httpClient, IOptions<DeribitColl
         };
 
         using var response = await httpClient.PostAsJsonAsync(string.Empty, request, JsonOptions, cancellationToken);
-        response.EnsureSuccessStatusCode();
+        if (!response.IsSuccessStatusCode)
+        {
+            var responseBody = await response.Content.ReadAsStringAsync(cancellationToken);
+            logger.LogError("Deribit HTTP request failed. Method={Method}, StatusCode={StatusCode}, Response={Response}.",
+                method,
+                (int)response.StatusCode,
+                responseBody);
+            response.EnsureSuccessStatusCode();
+        }
 
         var payload = await response.Content.ReadFromJsonAsync<DeribitRpcResponse<T>>(JsonOptions, cancellationToken);
         if (payload?.Error is not null)
         {
+            logger.LogError("Deribit RPC request failed. Method={Method}, Code={Code}, Message={Message}.",
+                method,
+                payload.Error.Code,
+                payload.Error.Message);
             throw new InvalidOperationException($"{method} failed: {payload.Error.Code} {payload.Error.Message}");
         }
 
         if (payload is null || payload.Result is null)
         {
+            logger.LogError("Deribit RPC request returned no result. Method={Method}.", method);
             throw new InvalidOperationException($"{method} returned no result.");
         }
 
@@ -140,10 +170,15 @@ public sealed class DeribitApiClient(HttpClient httpClient, IOptions<DeribitColl
             catch (Exception exception) when (attempt < _options.RestRetryCount)
             {
                 lastException = exception;
+                logger.LogWarning(exception, "Deribit REST operation failed. Operation={Operation}, Attempt={Attempt}/{RetryCount}.",
+                    operation,
+                    attempt,
+                    _options.RestRetryCount);
                 await Task.Delay(TimeSpan.FromTicks(_options.RestRetryDelay.Ticks * attempt), cancellationToken);
             }
         }
 
+        logger.LogError(lastException, "Deribit REST operation exhausted retries. Operation={Operation}.", operation);
         throw new InvalidOperationException($"{operation} failed.", lastException);
     }
 
@@ -165,4 +200,21 @@ public sealed class DeribitApiClient(HttpClient httpClient, IOptions<DeribitColl
                 ? null
                 : source.OptionType.Equals("call", StringComparison.OrdinalIgnoreCase) ? "Call" : "Put"
         };
+
+    private static bool MatchesQuoteAsset(DeribitInstrument source, string quoteAsset)
+    {
+        if (source.QuoteCurrency.Equals(quoteAsset, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return !string.IsNullOrWhiteSpace(source.CounterCurrency) &&
+               source.CounterCurrency.Equals(quoteAsset, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static JsonElement ToJson<T>(T value)
+    {
+        using var document = JsonDocument.Parse(JsonSerializer.Serialize(value));
+        return document.RootElement.Clone();
+    }
 }

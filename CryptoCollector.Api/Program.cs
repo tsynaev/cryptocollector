@@ -2,6 +2,8 @@ using CryptoCollector.API.Exchange.Services;
 using CryptoCollector.Api.Models;
 using CryptoCollector.Api.Options;
 using CryptoCollector.Api.Services;
+using CryptoCollector.Exchange.Bybit.Services;
+using CryptoCollector.Exchange.Deribit.Services;
 using CryptoCollector.Exchange.Bybit;
 using CryptoCollector.Exchange.Deribit;
 
@@ -13,13 +15,20 @@ builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddOpenApi();
 builder.Services.AddSwaggerGen();
 
-builder.Services.AddSingleton<InstrumentCatalog>();
 builder.Services.AddSingleton<DailyParquetStore>();
 builder.Services.AddSingleton<MinuteAggregationService>();
 builder.Services.AddSingleton<IMarketDataSink>(sp => sp.GetRequiredService<MinuteAggregationService>());
 builder.Services.AddHostedService(sp => sp.GetRequiredService<MinuteAggregationService>());
 builder.Services.AddBybitExchange(builder.Configuration);
 builder.Services.AddDeribitExchange(builder.Configuration);
+builder.Services.AddSingleton<IHostedService>(sp => new ExchangeCollectorService(
+    sp.GetRequiredService<BybitExchange>(),
+    sp.GetRequiredService<IMarketDataSink>(),
+    sp.GetRequiredService<ILogger<ExchangeCollectorService>>()));
+builder.Services.AddSingleton<IHostedService>(sp => new ExchangeCollectorService(
+    sp.GetRequiredService<DeribitExchange>(),
+    sp.GetRequiredService<IMarketDataSink>(),
+    sp.GetRequiredService<ILogger<ExchangeCollectorService>>()));
 
 var app = builder.Build();
 

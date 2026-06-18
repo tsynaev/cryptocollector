@@ -1,4 +1,5 @@
 using Bybit.Net.Clients;
+using CryptoExchange.Net.Objects;
 using CryptoCollector.API.Exchange.Abstractions;
 using CryptoCollector.Exchange.Bybit.Options;
 using CryptoCollector.Exchange.Bybit.Services;
@@ -13,12 +14,19 @@ public static class ServiceCollectionExtensions
     {
         services.Configure<BybitCollectorOptions>(configuration.GetSection(BybitCollectorOptions.SectionName));
         services.AddSingleton(_ => new BybitRestClient());
-        services.AddSingleton(_ => new BybitSocketClient());
+        services.AddSingleton(serviceProvider =>
+        {
+            var options = serviceProvider.GetRequiredService<Microsoft.Extensions.Options.IOptions<BybitCollectorOptions>>().Value;
+            return new BybitSocketClient(socketOptions =>
+            {
+                socketOptions.ReconnectPolicy = ReconnectPolicy.FixedDelay;
+                socketOptions.ReconnectInterval = options.ReconnectDelay;
+                socketOptions.V5Options.PingInterval = options.HeartbeatInterval;
+            });
+        });
         services.AddSingleton<BybitApiClient>();
-        services.AddSingleton<BybitCollectorHostedService>();
-        services.AddSingleton<IExchangeMarketDataClient>(sp => sp.GetRequiredService<BybitApiClient>());
-        services.AddSingleton<IExchangeCollector>(sp => sp.GetRequiredService<BybitCollectorHostedService>());
-        services.AddHostedService(sp => sp.GetRequiredService<BybitCollectorHostedService>());
+        services.AddSingleton<BybitExchange>();
+        services.AddSingleton<IExchange>(sp => sp.GetRequiredService<BybitExchange>());
         return services;
     }
 }

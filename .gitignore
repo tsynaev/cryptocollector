@@ -3,8 +3,6 @@ obj/
 data/
 *.log
 *.user
-_inspect_bybit/
 .vs/
-_publish_test/
 _temp/
-tmp/
+_temp/

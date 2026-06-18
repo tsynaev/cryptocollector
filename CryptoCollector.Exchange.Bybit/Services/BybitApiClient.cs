@@ -5,13 +5,18 @@ using CryptoCollector.API.Exchange.Abstractions;
 using CryptoCollector.API.Exchange.Models;
 using CryptoCollector.Exchange.Bybit.Options;
 using CryptoExchange.Net.Objects;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using System.Globalization;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 
 namespace CryptoCollector.Exchange.Bybit.Services;
 
-public sealed class BybitApiClient(BybitRestClient restClient, IOptions<BybitCollectorOptions> options) : IExchangeMarketDataClient
+public sealed class BybitApiClient(
+    BybitRestClient restClient,
+    IOptions<BybitCollectorOptions> options,
+    ILogger<BybitApiClient> logger)
 {
     private static readonly Regex OptionSymbolRegex = new(
         "^(?<base>[A-Z]+)-(?<expiry>\\d{1,2}[A-Z]{3}\\d{2})-(?<strike>\\d+(?:\\.\\d+)?)-(?<type>[CP])(?:-(?<settle>[A-Z]+))?$",
@@ -51,6 +56,19 @@ public sealed class BybitApiClient(BybitRestClient restClient, IOptions<BybitCol
             cancellationToken);
 
         return GetData(result, "GetOptionTickersAsync").List;
+    }
+
+    public async Task<IReadOnlyList<OptionChainSnapshot>> GetOptionChainSnapshotsAsync(CancellationToken cancellationToken)
+    {
+        var timestamp = DateTimeOffset.UtcNow;
+        var tickers = await GetOptionTickersAsync(_options.BaseAsset, cancellationToken);
+
+        return tickers.Select(ticker => new OptionChainSnapshot
+        {
+            Symbol = ticker.Symbol,
+            Payload = ToJson(ticker),
+            TimestampUtc = timestamp
+        }).ToArray();
     }
 
     public async Task<IReadOnlyList<BybitLinearInverseTicker>> GetLinearTickersAsync(string baseAsset, CancellationToken cancellationToken)
@@ -180,6 +198,12 @@ public sealed class BybitApiClient(BybitRestClient restClient, IOptions<BybitCol
                 return lastResult;
             }
 
+            logger.LogWarning("Bybit REST operation failed. Operation={Operation}, Attempt={Attempt}/{RetryCount}, Error={Error}.",
+                operation,
+                attempt,
+                _options.RestRetryCount,
+                lastResult.Error);
+
             if (attempt == _options.RestRetryCount)
             {
                 break;
@@ -188,6 +212,7 @@ public sealed class BybitApiClient(BybitRestClient restClient, IOptions<BybitCol
             await Task.Delay(TimeSpan.FromTicks(_options.RestRetryDelay.Ticks * attempt), cancellationToken);
         }
 
+        logger.LogError("Bybit REST operation exhausted retries. Operation={Operation}, Error={Error}.", operation, lastResult?.Error);
         throw new InvalidOperationException($"{operation} failed: {lastResult?.Error}");
     }
 
@@ -232,5 +257,11 @@ public sealed class BybitApiClient(BybitRestClient restClient, IOptions<BybitCol
         return decimal.TryParse(optionMatch.Groups["strike"].Value, NumberStyles.Any, CultureInfo.InvariantCulture, out var strikeValue)
             ? strikeValue
             : null;
+    }
+
+    private static JsonElement ToJson<T>(T value)
+    {
+        using var document = JsonDocument.Parse(JsonSerializer.Serialize(value));
+        return document.RootElement.Clone();
     }
 }
