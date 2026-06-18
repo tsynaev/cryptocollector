@@ -1,11 +1,14 @@
 using Bybit.Net.Clients;
+using Bybit.Net.Objects.Models.V5;
 using CryptoCollector.API.Exchange.Abstractions;
 using CryptoCollector.API.Exchange.Models;
-using CryptoCollector.API.Exchange.Services;
 using CryptoCollector.Exchange.Bybit.Options;
 using CryptoExchange.Net.Objects.Sockets;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using System.Globalization;
+using System.Runtime.CompilerServices;
+using System.Threading.Channels;
 
 namespace CryptoCollector.Exchange.Bybit.Services;
 
@@ -24,30 +27,53 @@ public sealed class BybitExchange(
     public Task<IReadOnlyList<InstrumentDefinition>> GetTrackedInstrumentsAsync(CancellationToken cancellationToken) =>
         apiClient.GetTrackedInstrumentsAsync(_options.BaseAsset, _options.QuoteAsset, cancellationToken);
 
-    public async Task BootstrapAsync(IReadOnlyList<InstrumentDefinition> instruments, IMarketDataSink sink, CancellationToken cancellationToken)
-    {
-        await BootstrapLinearTickersAsync(instruments, sink, cancellationToken);
-        await BootstrapLinearTradesAsync(instruments, sink, cancellationToken);
-        await BootstrapOptionTradesAsync(instruments, sink, cancellationToken);
-    }
+    public async Task<ExchangeBootstrapBatch> BootstrapAsync(IReadOnlyList<InstrumentDefinition> instruments, CancellationToken cancellationToken) =>
+        new()
+        {
+            Tickers = await BootstrapLinearTickersAsync(instruments, cancellationToken),
+            Trades = (await BootstrapLinearTradesAsync(instruments, cancellationToken))
+                .Concat(await BootstrapOptionTradesAsync(instruments, cancellationToken))
+                .ToArray()
+        };
 
-    public async Task PollOptionChainSnapshotsAsync(IReadOnlyList<InstrumentDefinition> instruments, IMarketDataSink sink, CancellationToken cancellationToken)
+    public async Task<IReadOnlyList<ExchangeOptionMessage>> PollOptionChainSnapshotsAsync(IReadOnlyList<InstrumentDefinition> instruments, CancellationToken cancellationToken)
     {
         var trackedSymbols = instruments
             .Where(static x => x.Category.Equals("option", StringComparison.OrdinalIgnoreCase))
             .ToDictionary(static x => x.Symbol, StringComparer.OrdinalIgnoreCase);
+        var result = new List<ExchangeOptionMessage>();
 
         var snapshots = await apiClient.GetOptionChainSnapshotsAsync(cancellationToken);
         foreach (var snapshot in snapshots)
         {
             if (trackedSymbols.TryGetValue(snapshot.Symbol, out var instrument))
             {
-                sink.IngestTicker(instrument, snapshot.Payload, snapshot.TimestampUtc);
+                result.Add(new ExchangeOptionMessage(instrument, snapshot.Ticker));
             }
         }
+
+        return result;
     }
 
-    public async Task StreamAsync(IReadOnlyList<InstrumentDefinition> instruments, IMarketDataSink sink, CancellationToken cancellationToken)
+    public async IAsyncEnumerable<ExchangeDataMessage> StreamAsync(
+        IReadOnlyList<InstrumentDefinition> instruments,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        var channel = Channel.CreateUnbounded<ExchangeDataMessage>();
+        var producer = RunStreamAsync(instruments, channel.Writer, cancellationToken);
+
+        await foreach (var message in channel.Reader.ReadAllAsync(cancellationToken))
+        {
+            yield return message;
+        }
+
+        await producer;
+    }
+
+    private async Task RunStreamAsync(
+        IReadOnlyList<InstrumentDefinition> instruments,
+        ChannelWriter<ExchangeDataMessage> writer,
+        CancellationToken cancellationToken)
     {
         var subscriptions = new List<UpdateSubscription>();
         var linearInstruments = instruments.Where(static x => x.Category.Equals("linear", StringComparison.OrdinalIgnoreCase));
@@ -66,11 +92,11 @@ public sealed class BybitExchange(
                         chunk,
                         update =>
                         {
-                            if (linearSymbols.TryGetValue(update.Data.Symbol, out var instrument))
-                            {
-                                sink.IngestTicker(instrument, update.Data, DateTimeOffset.UtcNow);
-                            }
-                        },
+                                if (linearSymbols.TryGetValue(update.Data.Symbol, out var instrument))
+                                {
+                                    writer.TryWrite(new ExchangeTickerMessage(instrument, BybitApiClient.MapLinearTicker(update.Data, DateTimeOffset.UtcNow)));
+                                }
+                            },
                         cancellationToken)));
 
                 subscriptions.Add(await SubscribeAsync(
@@ -82,7 +108,7 @@ public sealed class BybitExchange(
                             {
                                 if (linearSymbols.TryGetValue(trade.Symbol, out var instrument))
                                 {
-                                    sink.IngestTrade(instrument, trade);
+                                    writer.TryWrite(new ExchangeTradeMessage(instrument, MapTrade(trade)));
                                 }
                             }
                         },
@@ -98,7 +124,7 @@ public sealed class BybitExchange(
                         {
                             if (optionSymbols.TryGetValue(trade.Symbol, out var instrument))
                             {
-                                sink.IngestTrade(instrument, trade);
+                                writer.TryWrite(new ExchangeTradeMessage(instrument, MapTrade(trade)));
                             }
                         }
                     },
@@ -117,6 +143,11 @@ public sealed class BybitExchange(
 
             await connectionClosedSignal.Task.WaitAsync(cancellationToken);
         }
+        catch (Exception exception)
+        {
+            writer.TryComplete(exception);
+            throw;
+        }
         finally
         {
             foreach (var subscription in subscriptions)
@@ -130,14 +161,17 @@ public sealed class BybitExchange(
                     logger.LogWarning(exception, "Bybit websocket unsubscribe failed.");
                 }
             }
+
+            writer.TryComplete();
         }
     }
 
-    private async Task BootstrapLinearTickersAsync(IReadOnlyList<InstrumentDefinition> instruments, IMarketDataSink sink, CancellationToken cancellationToken)
+    private async Task<IReadOnlyList<ExchangeTickerMessage>> BootstrapLinearTickersAsync(IReadOnlyList<InstrumentDefinition> instruments, CancellationToken cancellationToken)
     {
         var trackedSymbols = instruments
             .Where(static x => x.Category.Equals("linear", StringComparison.OrdinalIgnoreCase))
             .ToDictionary(static x => x.Symbol, StringComparer.OrdinalIgnoreCase);
+        var result = new List<ExchangeTickerMessage>();
 
         var tickers = await apiClient.GetLinearTickersAsync(_options.BaseAsset, cancellationToken);
         var timestamp = DateTimeOffset.UtcNow;
@@ -146,37 +180,46 @@ public sealed class BybitExchange(
         {
             if (trackedSymbols.TryGetValue(ticker.Symbol, out var instrument))
             {
-                sink.IngestTicker(instrument, ticker, timestamp);
+                result.Add(new ExchangeTickerMessage(instrument, BybitApiClient.MapLinearTicker(ticker, timestamp)));
             }
         }
+
+        return result;
     }
 
-    private async Task BootstrapLinearTradesAsync(IReadOnlyList<InstrumentDefinition> instruments, IMarketDataSink sink, CancellationToken cancellationToken)
+    private async Task<IReadOnlyList<ExchangeTradeMessage>> BootstrapLinearTradesAsync(IReadOnlyList<InstrumentDefinition> instruments, CancellationToken cancellationToken)
     {
+        var result = new List<ExchangeTradeMessage>();
+
         foreach (var instrument in instruments.Where(static x => x.Category.Equals("linear", StringComparison.OrdinalIgnoreCase)))
         {
             var trades = await apiClient.GetRecentLinearTradesAsync(instrument.Symbol, cancellationToken);
             foreach (var trade in trades)
             {
-                sink.IngestTrade(instrument, trade);
+                result.Add(new ExchangeTradeMessage(instrument, MapTrade(trade)));
             }
         }
+
+        return result;
     }
 
-    private async Task BootstrapOptionTradesAsync(IReadOnlyList<InstrumentDefinition> instruments, IMarketDataSink sink, CancellationToken cancellationToken)
+    private async Task<IReadOnlyList<ExchangeTradeMessage>> BootstrapOptionTradesAsync(IReadOnlyList<InstrumentDefinition> instruments, CancellationToken cancellationToken)
     {
         var trackedSymbols = instruments
             .Where(static x => x.Category.Equals("option", StringComparison.OrdinalIgnoreCase))
             .ToDictionary(static x => x.Symbol, StringComparer.OrdinalIgnoreCase);
+        var result = new List<ExchangeTradeMessage>();
 
         var trades = await apiClient.GetRecentOptionTradesAsync(_options.BaseAsset, cancellationToken);
         foreach (var trade in trades)
         {
             if (trackedSymbols.TryGetValue(trade.Symbol, out var instrument))
             {
-                sink.IngestTrade(instrument, trade);
+                result.Add(new ExchangeTradeMessage(instrument, MapTrade(trade)));
             }
         }
+
+        return result;
     }
 
     private async Task<UpdateSubscription> SubscribeAsync(Task<CryptoExchange.Net.Objects.CallResult<UpdateSubscription>> task)
@@ -190,4 +233,35 @@ public sealed class BybitExchange(
 
         return result.Data;
     }
+
+    private static ExchangeTrade MapTrade(BybitTrade trade) =>
+        new()
+        {
+            TradeTime = new DateTimeOffset(trade.Timestamp).ToUnixTimeMilliseconds(),
+            Symbol = trade.Symbol,
+            Side = trade.Side.ToString(),
+            Size = trade.Quantity.ToString(CultureInfo.InvariantCulture),
+            Price = trade.Price.ToString(CultureInfo.InvariantCulture),
+            TradeId = trade.TradeId,
+            IsBlockTrade = trade.IsBlockTrade ?? false,
+            BlockTradeId = null,
+            IsRpiTrade = trade.IsRpiTrade ?? false,
+            Sequence = (trade.Sequence ?? 0).ToString(CultureInfo.InvariantCulture)
+        };
+
+    private static ExchangeTrade MapTrade(BybitTradeHistory trade) =>
+        new()
+        {
+            TradeTime = new DateTimeOffset(trade.Timestamp).ToUnixTimeMilliseconds(),
+            Symbol = trade.Symbol,
+            Side = trade.Side.ToString(),
+            Size = trade.Quantity.ToString(CultureInfo.InvariantCulture),
+            Price = trade.Price.ToString(CultureInfo.InvariantCulture),
+            TradeId = trade.TradeId,
+            IsBlockTrade = trade.IsBlockTrade,
+            BlockTradeId = null,
+            IsRpiTrade = trade.IsRpiTrade ?? false,
+            Sequence = (trade.Sequence ?? 0).ToString(CultureInfo.InvariantCulture)
+        };
+
 }

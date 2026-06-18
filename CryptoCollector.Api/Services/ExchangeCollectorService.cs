@@ -41,7 +41,8 @@ public sealed class ExchangeCollectorService(
 
                 try
                 {
-                    await exchange.BootstrapAsync(instruments, marketDataSink, stoppingToken);
+                    var bootstrap = await exchange.BootstrapAsync(instruments, stoppingToken);
+                    FlushBootstrap(bootstrap);
                 }
                 catch (Exception exception)
                 {
@@ -50,7 +51,8 @@ public sealed class ExchangeCollectorService(
 
                 try
                 {
-                    await exchange.PollOptionChainSnapshotsAsync(instruments, marketDataSink, stoppingToken);
+                    var options = await exchange.PollOptionChainSnapshotsAsync(instruments, stoppingToken);
+                    FlushOptions(options);
                 }
                 catch (Exception exception)
                 {
@@ -63,7 +65,10 @@ public sealed class ExchangeCollectorService(
 
                 try
                 {
-                    await exchange.StreamAsync(instruments, marketDataSink, linkedCts.Token);
+                    await foreach (var message in exchange.StreamAsync(instruments, linkedCts.Token))
+                    {
+                        FlushMessage(message);
+                    }
                 }
                 catch (OperationCanceledException) when (linkedCts.IsCancellationRequested)
                 {
@@ -114,7 +119,8 @@ public sealed class ExchangeCollectorService(
         {
             try
             {
-                await exchange.PollOptionChainSnapshotsAsync(instruments, marketDataSink, cancellationToken);
+                var options = await exchange.PollOptionChainSnapshotsAsync(instruments, cancellationToken);
+                FlushOptions(options);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -124,6 +130,47 @@ public sealed class ExchangeCollectorService(
             {
                 logger.LogWarning(exception, "{Exchange} option-chain snapshot poll failed.", exchange.Name);
             }
+        }
+    }
+
+    private void FlushBootstrap(ExchangeBootstrapBatch bootstrap)
+    {
+        foreach (var trade in bootstrap.Trades)
+        {
+            marketDataSink.IngestTrade(trade.Instrument, trade.Trade);
+        }
+
+        foreach (var ticker in bootstrap.Tickers)
+        {
+            marketDataSink.IngestTicker(ticker.Instrument, ticker.Ticker);
+        }
+
+        FlushOptions(bootstrap.Options);
+    }
+
+    private void FlushOptions(IReadOnlyList<ExchangeOptionMessage> options)
+    {
+        foreach (var option in options)
+        {
+            marketDataSink.IngestOption(option.Instrument, option.OptionTicker);
+        }
+    }
+
+    private void FlushMessage(ExchangeDataMessage message)
+    {
+        switch (message)
+        {
+            case ExchangeTradeMessage trade:
+                marketDataSink.IngestTrade(trade.Instrument, trade.Trade);
+                break;
+            case ExchangeTickerMessage ticker:
+                marketDataSink.IngestTicker(ticker.Instrument, ticker.Ticker);
+                break;
+            case ExchangeOptionMessage option:
+                marketDataSink.IngestOption(option.Instrument, option.OptionTicker);
+                break;
+            default:
+                throw new InvalidOperationException($"Unsupported exchange message type: {message.GetType().Name}");
         }
     }
 }

@@ -45,8 +45,7 @@ public sealed class DeribitApiClient(
         return summaries.Select(summary => new OptionChainSnapshot
         {
             Symbol = summary.InstrumentName,
-            Payload = ToJson(summary),
-            TimestampUtc = timestamp
+            Ticker = MapOptionTicker(summary, timestamp)
         }).ToArray();
     }
 
@@ -212,9 +211,29 @@ public sealed class DeribitApiClient(
                source.CounterCurrency.Equals(quoteAsset, StringComparison.OrdinalIgnoreCase);
     }
 
-    private static JsonElement ToJson<T>(T value)
-    {
-        using var document = JsonDocument.Parse(JsonSerializer.Serialize(value));
-        return document.RootElement.Clone();
-    }
+    public static ExchangeTicker MapFutureTicker(DeribitBookSummary summary, DateTimeOffset timestampUtc) =>
+        new()
+        {
+            TimestampUtc = timestampUtc,
+            LastPrice = summary.Last,
+            MarkPrice = summary.MarkPrice,
+            BidPrice = summary.BidPrice,
+            AskPrice = summary.AskPrice,
+            OpenInterest = summary.OpenInterest,
+            Volume24h = summary.Volume
+        };
+
+    public static ExchangeOptionTicker MapOptionTicker(DeribitBookSummary summary, DateTimeOffset timestampUtc) =>
+        new()
+        {
+            TimestampUtc = timestampUtc,
+            BidPrice = summary.BidPrice,
+            AskPrice = summary.AskPrice,
+            LastPrice = summary.Last,
+            MarkPrice = summary.MarkPrice,
+            UnderlyingPrice = summary.UnderlyingPrice,
+            OpenInterest = summary.OpenInterest,
+            Volume24h = summary.Volume,
+            Change24h = summary.PriceChange
+        };
 }

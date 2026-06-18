@@ -8,7 +8,6 @@ using CryptoExchange.Net.Objects;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using System.Globalization;
-using System.Text.Json;
 using System.Text.RegularExpressions;
 
 namespace CryptoCollector.Exchange.Bybit.Services;
@@ -66,8 +65,7 @@ public sealed class BybitApiClient(
         return tickers.Select(ticker => new OptionChainSnapshot
         {
             Symbol = ticker.Symbol,
-            Payload = ToJson(ticker),
-            TimestampUtc = timestamp
+            Ticker = MapOptionTicker(ticker, timestamp)
         }).ToArray();
     }
 
@@ -259,9 +257,101 @@ public sealed class BybitApiClient(
             : null;
     }
 
-    private static JsonElement ToJson<T>(T value)
-    {
-        using var document = JsonDocument.Parse(JsonSerializer.Serialize(value));
-        return document.RootElement.Clone();
-    }
+    public static ExchangeTicker MapLinearTicker(BybitLinearInverseTicker ticker, DateTimeOffset timestampUtc) =>
+        new()
+        {
+            TimestampUtc = timestampUtc,
+            LastPrice = ticker.LastPrice,
+            MarkPrice = ticker.MarkPrice,
+            IndexPrice = ticker.IndexPrice,
+            BidPrice = ticker.BestBidPrice,
+            BidSize = ticker.BestBidQuantity,
+            AskPrice = ticker.BestAskPrice,
+            AskSize = ticker.BestAskQuantity,
+            OpenInterest = ticker.OpenInterest,
+            OpenInterestValue = ticker.OpenInterestValue,
+            Volume24h = ticker.Volume24h,
+            Turnover24h = ticker.Turnover24h,
+            FundingRate = ticker.FundingRate,
+            BasisRate = ticker.BasisRate,
+            BasisRateYear = ticker.BasisRateYear,
+            DeliveryUtc = ticker.DeliveryTime,
+            NextFundingTimeUtc = ticker.NextFundingTime
+        };
+
+    public static ExchangeTicker MapLinearTicker(BybitLinearTickerUpdate ticker, DateTimeOffset timestampUtc) =>
+        new()
+        {
+            TimestampUtc = timestampUtc,
+            LastPrice = ticker.LastPrice,
+            MarkPrice = ticker.MarkPrice,
+            IndexPrice = ticker.IndexPrice,
+            BidPrice = ticker.BestBidPrice,
+            BidSize = ticker.BestBidQuantity,
+            AskPrice = ticker.BestAskPrice,
+            AskSize = ticker.BestAskQuantity,
+            OpenInterest = ticker.OpenInterest,
+            OpenInterestValue = ticker.OpenInterestValue,
+            Volume24h = ticker.Volume24h,
+            Turnover24h = ticker.Turnover24h,
+            FundingRate = ticker.FundingRate,
+            BasisRate = ticker.BasisRate,
+            BasisRateYear = ticker.BasisRateYear,
+            DeliveryUtc = ticker.DeliveryTime,
+            NextFundingTimeUtc = ticker.NextFundingTime
+        };
+
+    public static ExchangeOptionTicker MapOptionTicker(BybitOptionTicker ticker, DateTimeOffset timestampUtc) =>
+        new()
+        {
+            TimestampUtc = timestampUtc,
+            BidPrice = ticker.BestBidPrice,
+            BidSize = ticker.BestBidQuantity,
+            BidIv = ticker.BestBidIv,
+            AskPrice = ticker.BestAskPrice,
+            AskSize = ticker.BestAskQuantity,
+            AskIv = ticker.BestAskIv,
+            LastPrice = ticker.LastPrice,
+            MarkPrice = ticker.MarkPrice,
+            IndexPrice = ticker.IndexPrice,
+            MarkIv = ticker.MarkIv,
+            UnderlyingPrice = ticker.UnderlyingPrice,
+            OpenInterest = ticker.OpenInterest,
+            Volume24h = ticker.Volume24h,
+            Turnover24h = ticker.Turnover24h,
+            TotalVolume = ticker.TotalVolume,
+            TotalTurnover = ticker.TotalTurnover,
+            Delta = ticker.Delta,
+            Gamma = ticker.Gamma,
+            Vega = ticker.Vega,
+            Theta = ticker.Theta,
+            Change24h = ticker.Change24h
+        };
+
+    public static ExchangeOptionTicker MapOptionTicker(BybitOptionTickerUpdate ticker, DateTimeOffset timestampUtc) =>
+        new()
+        {
+            TimestampUtc = timestampUtc,
+            BidPrice = ticker.BestBidPrice,
+            BidSize = ticker.BestBidQuantity,
+            BidIv = ticker.BidIv,
+            AskPrice = ticker.BestAskPrice,
+            AskSize = ticker.BestAskQuantity,
+            AskIv = ticker.AskIv,
+            LastPrice = ticker.LastPrice,
+            MarkPrice = ticker.MarkPrice,
+            IndexPrice = ticker.IndexPrice,
+            MarkIv = ticker.MarkPriceIv,
+            UnderlyingPrice = ticker.UnderlyingPrice,
+            OpenInterest = ticker.OpenInterest,
+            Volume24h = ticker.Volume24h,
+            Turnover24h = ticker.Turnover24h,
+            TotalVolume = ticker.TotalVolume,
+            TotalTurnover = ticker.TotalTurnover,
+            Delta = ticker.Delta,
+            Gamma = ticker.Gamma,
+            Vega = ticker.Vega,
+            Theta = ticker.Theta,
+            Change24h = ticker.Change24h
+        };
 }

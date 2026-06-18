@@ -1,9 +1,10 @@
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
+using System.Runtime.CompilerServices;
+using System.Threading.Channels;
 using CryptoCollector.API.Exchange.Abstractions;
 using CryptoCollector.API.Exchange.Models;
-using CryptoCollector.API.Exchange.Services;
 using CryptoCollector.Exchange.Deribit.Models;
 using CryptoCollector.Exchange.Deribit.Options;
 using Microsoft.Extensions.Logging;
@@ -26,7 +27,7 @@ public sealed class DeribitExchange(
     public Task<IReadOnlyList<InstrumentDefinition>> GetTrackedInstrumentsAsync(CancellationToken cancellationToken) =>
         apiClient.GetTrackedInstrumentsAsync(_options.BaseAsset, _options.QuoteAsset, cancellationToken);
 
-    public async Task BootstrapAsync(IReadOnlyList<InstrumentDefinition> instruments, IMarketDataSink sink, CancellationToken cancellationToken)
+    public async Task<ExchangeBootstrapBatch> BootstrapAsync(IReadOnlyList<InstrumentDefinition> instruments, CancellationToken cancellationToken)
     {
         var optionSymbols = instruments
             .Where(static x => x.Category.Equals("option", StringComparison.OrdinalIgnoreCase))
@@ -34,13 +35,15 @@ public sealed class DeribitExchange(
         var futureSymbols = instruments
             .Where(static x => x.Category.Equals("future", StringComparison.OrdinalIgnoreCase) || x.Category.Equals("perpetual", StringComparison.OrdinalIgnoreCase))
             .ToDictionary(static x => x.Symbol, StringComparer.OrdinalIgnoreCase);
+        var tickers = new List<ExchangeTickerMessage>();
+        var trades = new List<ExchangeTradeMessage>();
 
         var futureSummaries = await apiClient.GetFutureSummariesAsync(_options.BaseAsset, cancellationToken);
         foreach (var summary in futureSummaries)
         {
             if (futureSymbols.TryGetValue(summary.InstrumentName, out var instrument))
             {
-                sink.IngestTicker(instrument, ToJson(summary), DateTimeOffset.UtcNow);
+                tickers.Add(new ExchangeTickerMessage(instrument, DeribitApiClient.MapFutureTicker(summary, DateTimeOffset.UtcNow)));
             }
         }
 
@@ -49,7 +52,7 @@ public sealed class DeribitExchange(
         {
             if (optionSymbols.TryGetValue(trade.InstrumentName, out var instrument))
             {
-                sink.IngestTrade(instrument, MapTrade(trade));
+                trades.Add(new ExchangeTradeMessage(instrument, MapTrade(trade)));
             }
         }
 
@@ -58,28 +61,55 @@ public sealed class DeribitExchange(
         {
             if (futureSymbols.TryGetValue(trade.InstrumentName, out var instrument))
             {
-                sink.IngestTrade(instrument, MapTrade(trade));
+                trades.Add(new ExchangeTradeMessage(instrument, MapTrade(trade)));
             }
         }
+
+        return new ExchangeBootstrapBatch
+        {
+            Tickers = tickers,
+            Trades = trades
+        };
     }
 
-    public async Task PollOptionChainSnapshotsAsync(IReadOnlyList<InstrumentDefinition> instruments, IMarketDataSink sink, CancellationToken cancellationToken)
+    public async Task<IReadOnlyList<ExchangeOptionMessage>> PollOptionChainSnapshotsAsync(IReadOnlyList<InstrumentDefinition> instruments, CancellationToken cancellationToken)
     {
         var optionSymbols = instruments
             .Where(static x => x.Category.Equals("option", StringComparison.OrdinalIgnoreCase))
             .ToDictionary(static x => x.Symbol, StringComparer.OrdinalIgnoreCase);
+        var result = new List<ExchangeOptionMessage>();
 
         var snapshots = await apiClient.GetOptionChainSnapshotsAsync(cancellationToken);
         foreach (var snapshot in snapshots)
         {
             if (optionSymbols.TryGetValue(snapshot.Symbol, out var instrument))
             {
-                sink.IngestTicker(instrument, snapshot.Payload, snapshot.TimestampUtc);
+                result.Add(new ExchangeOptionMessage(instrument, snapshot.Ticker));
             }
         }
+
+        return result;
     }
 
-    public async Task StreamAsync(IReadOnlyList<InstrumentDefinition> instruments, IMarketDataSink sink, CancellationToken cancellationToken)
+    public async IAsyncEnumerable<ExchangeDataMessage> StreamAsync(
+        IReadOnlyList<InstrumentDefinition> instruments,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        var channel = Channel.CreateUnbounded<ExchangeDataMessage>();
+        var producer = RunStreamAsync(instruments, channel.Writer, cancellationToken);
+
+        await foreach (var message in channel.Reader.ReadAllAsync(cancellationToken))
+        {
+            yield return message;
+        }
+
+        await producer;
+    }
+
+    private async Task RunStreamAsync(
+        IReadOnlyList<InstrumentDefinition> instruments,
+        ChannelWriter<ExchangeDataMessage> writer,
+        CancellationToken cancellationToken)
     {
         var instrumentMap = instruments.ToDictionary(static x => x.Symbol, StringComparer.OrdinalIgnoreCase);
         var tickerChannels = instruments
@@ -100,14 +130,13 @@ public sealed class DeribitExchange(
 
         using var groupCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var socketTasks = socketGroups
-            .Select(group => RunSocketUntilDisconnectedAsync(group, instrumentMap, sink, groupCts.Token))
+            .Select(group => RunSocketUntilDisconnectedAsync(group, instrumentMap, writer, groupCts.Token))
             .ToArray();
-
-        await Task.WhenAny(socketTasks);
-        await groupCts.CancelAsync();
 
         try
         {
+            await Task.WhenAny(socketTasks);
+            await groupCts.CancelAsync();
             await Task.WhenAll(socketTasks);
         }
         catch (OperationCanceledException) when (groupCts.IsCancellationRequested)
@@ -115,14 +144,20 @@ public sealed class DeribitExchange(
         }
         catch (Exception exception)
         {
+            writer.TryComplete(exception);
             logger.LogWarning(exception, "Deribit socket group terminated with an exception.");
+            throw;
+        }
+        finally
+        {
+            writer.TryComplete();
         }
     }
 
     private async Task RunSocketUntilDisconnectedAsync(
         DeribitSocketSubscriptionGroup group,
         IReadOnlyDictionary<string, InstrumentDefinition> instrumentMap,
-        IMarketDataSink sink,
+        ChannelWriter<ExchangeDataMessage> writer,
         CancellationToken cancellationToken)
     {
         using var socket = new ClientWebSocket();
@@ -224,7 +259,11 @@ public sealed class DeribitExchange(
 
                 if (symbol is not null && instrumentMap.TryGetValue(symbol, out var instrument))
                 {
-                    sink.IngestTicker(instrument, payload.Params.Data, DateTimeOffset.UtcNow);
+                    var summary = payload.Params.Data.Deserialize<DeribitBookSummary>(JsonOptions);
+                    if (summary is not null)
+                    {
+                        writer.TryWrite(new ExchangeTickerMessage(instrument, DeribitApiClient.MapFutureTicker(summary, DateTimeOffset.UtcNow)));
+                    }
                 }
 
                 continue;
@@ -243,7 +282,7 @@ public sealed class DeribitExchange(
 
                     if (instrumentMap.TryGetValue(trade.InstrumentName, out var instrument))
                     {
-                        sink.IngestTrade(instrument, MapTrade(trade));
+                        writer.TryWrite(new ExchangeTradeMessage(instrument, MapTrade(trade)));
                     }
                 }
             }
@@ -341,12 +380,6 @@ public sealed class DeribitExchange(
 
         heartbeatType = typeProperty.GetString();
         return !string.IsNullOrWhiteSpace(heartbeatType);
-    }
-
-    private static JsonElement ToJson<T>(T value)
-    {
-        using var document = JsonDocument.Parse(JsonSerializer.Serialize(value));
-        return document.RootElement.Clone();
     }
 
     private static ExchangeTrade MapTrade(DeribitTrade trade) =>

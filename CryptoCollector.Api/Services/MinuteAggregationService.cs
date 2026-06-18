@@ -1,7 +1,5 @@
 using System.Collections.Concurrent;
 using System.Globalization;
-using System.Text.Json;
-using Bybit.Net.Objects.Models.V5;
 using CryptoCollector.API.Exchange.Models;
 using CryptoCollector.API.Exchange.Services;
 using CryptoCollector.Api.Models;
@@ -69,103 +67,20 @@ public sealed class MinuteAggregationService(
         });
     }
 
-    public void IngestTrade(InstrumentDefinition instrument, BybitTrade trade)
+    public void IngestTicker(InstrumentDefinition instrument, ExchangeTicker ticker)
     {
-        IngestTrade(instrument, new ExchangeTrade
-        {
-            TradeTime = new DateTimeOffset(trade.Timestamp).ToUnixTimeMilliseconds(),
-            Symbol = trade.Symbol,
-            Side = trade.Side.ToString(),
-            Size = trade.Quantity.ToString(CultureInfo.InvariantCulture),
-            Price = trade.Price.ToString(CultureInfo.InvariantCulture),
-            TradeId = trade.TradeId,
-            IsBlockTrade = trade.IsBlockTrade ?? false,
-            BlockTradeId = null,
-            IsRpiTrade = trade.IsRpiTrade ?? false,
-            Sequence = (trade.Sequence ?? 0).ToString(CultureInfo.InvariantCulture)
-        });
-    }
-
-    public void IngestTrade(InstrumentDefinition instrument, BybitTradeHistory trade)
-    {
-        IngestTrade(instrument, new ExchangeTrade
-        {
-            TradeTime = new DateTimeOffset(trade.Timestamp).ToUnixTimeMilliseconds(),
-            Symbol = trade.Symbol,
-            Side = trade.Side.ToString(),
-            Size = trade.Quantity.ToString(CultureInfo.InvariantCulture),
-            Price = trade.Price.ToString(CultureInfo.InvariantCulture),
-            TradeId = trade.TradeId,
-            IsBlockTrade = trade.IsBlockTrade,
-            BlockTradeId = null,
-            IsRpiTrade = trade.IsRpiTrade ?? false,
-            Sequence = (trade.Sequence ?? 0).ToString(CultureInfo.InvariantCulture)
-        });
-    }
-
-    public void IngestTrade(InstrumentDefinition instrument, BybitOptionTrade trade)
-    {
-        IngestTrade(instrument, new ExchangeTrade
-        {
-            TradeTime = new DateTimeOffset(trade.Timestamp).ToUnixTimeMilliseconds(),
-            Symbol = trade.Symbol,
-            Side = trade.Side.ToString(),
-            Size = trade.Quantity.ToString(CultureInfo.InvariantCulture),
-            Price = trade.Price.ToString(CultureInfo.InvariantCulture),
-            TradeId = trade.TradeId,
-            IsBlockTrade = trade.IsBlockTrade ?? false,
-            BlockTradeId = null,
-            IsRpiTrade = trade.IsRpiTrade ?? false,
-            Sequence = (trade.Sequence ?? 0).ToString(CultureInfo.InvariantCulture)
-        });
-    }
-
-    public void IngestTicker(InstrumentDefinition instrument, JsonElement payload, DateTimeOffset eventTimestamp)
-    {
-        var minute = FloorToMinute(eventTimestamp.UtcDateTime);
-        var key = $"{instrument.Exchange}|{instrument.Symbol}|{minute:O}";
-
-        if (instrument.MarketType.Equals("option", StringComparison.OrdinalIgnoreCase))
-        {
-            var accumulator = _optionBars.GetOrAdd(key, _ => new OptionChainAccumulator(instrument, minute));
-            accumulator.Apply(payload, eventTimestamp.UtcDateTime);
-            return;
-        }
-
-        var tickerAccumulator = _tickerBars.GetOrAdd(key, _ => new TickerAccumulator(instrument, minute));
-        tickerAccumulator.Apply(payload, eventTimestamp.UtcDateTime);
-    }
-
-    public void IngestTicker(InstrumentDefinition instrument, BybitLinearTickerUpdate payload, DateTimeOffset eventTimestamp)
-    {
-        var minute = FloorToMinute(eventTimestamp.UtcDateTime);
+        var minute = FloorToMinute(ticker.TimestampUtc.UtcDateTime);
         var key = $"{instrument.Exchange}|{instrument.Symbol}|{minute:O}";
         var tickerAccumulator = _tickerBars.GetOrAdd(key, _ => new TickerAccumulator(instrument, minute));
-        tickerAccumulator.Apply(payload, eventTimestamp.UtcDateTime);
+        tickerAccumulator.Apply(ticker);
     }
 
-    public void IngestTicker(InstrumentDefinition instrument, BybitLinearInverseTicker payload, DateTimeOffset eventTimestamp)
+    public void IngestOption(InstrumentDefinition instrument, ExchangeOptionTicker optionTicker)
     {
-        var minute = FloorToMinute(eventTimestamp.UtcDateTime);
-        var key = $"{instrument.Exchange}|{instrument.Symbol}|{minute:O}";
-        var tickerAccumulator = _tickerBars.GetOrAdd(key, _ => new TickerAccumulator(instrument, minute));
-        tickerAccumulator.Apply(payload, eventTimestamp.UtcDateTime);
-    }
-
-    public void IngestTicker(InstrumentDefinition instrument, BybitOptionTickerUpdate payload, DateTimeOffset eventTimestamp)
-    {
-        var minute = FloorToMinute(eventTimestamp.UtcDateTime);
+        var minute = FloorToMinute(optionTicker.TimestampUtc.UtcDateTime);
         var key = $"{instrument.Exchange}|{instrument.Symbol}|{minute:O}";
         var accumulator = _optionBars.GetOrAdd(key, _ => new OptionChainAccumulator(instrument, minute));
-        accumulator.Apply(payload, eventTimestamp.UtcDateTime);
-    }
-
-    public void IngestTicker(InstrumentDefinition instrument, BybitOptionTicker payload, DateTimeOffset eventTimestamp)
-    {
-        var minute = FloorToMinute(eventTimestamp.UtcDateTime);
-        var key = $"{instrument.Exchange}|{instrument.Symbol}|{minute:O}";
-        var accumulator = _optionBars.GetOrAdd(key, _ => new OptionChainAccumulator(instrument, minute));
-        accumulator.Apply(payload, eventTimestamp.UtcDateTime);
+        accumulator.Apply(optionTicker);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -374,71 +289,6 @@ public sealed class MinuteAggregationService(
         return counts;
     }
 
-    private static decimal? ReadNullableDecimal(JsonElement element, string propertyName)
-    {
-        if (!element.TryGetProperty(propertyName, out var property))
-        {
-            return null;
-        }
-
-        if (property.ValueKind == JsonValueKind.Null)
-        {
-            return null;
-        }
-
-        var raw = property.ValueKind == JsonValueKind.String ? property.GetString() : property.GetRawText();
-        if (string.IsNullOrWhiteSpace(raw))
-        {
-            return null;
-        }
-
-        return decimal.TryParse(raw, NumberStyles.Any, CultureInfo.InvariantCulture, out var value) ? value : null;
-    }
-
-    private static decimal? ReadNestedNullableDecimal(JsonElement element, string propertyName, string nestedPropertyName)
-    {
-        if (!element.TryGetProperty(propertyName, out var property) || property.ValueKind != JsonValueKind.Object)
-        {
-            return null;
-        }
-
-        return ReadNullableDecimal(property, nestedPropertyName);
-    }
-
-    private static DateTime? ReadNullableUnixMilliseconds(JsonElement element, string propertyName)
-    {
-        if (!element.TryGetProperty(propertyName, out var property))
-        {
-            return null;
-        }
-
-        var raw = property.ValueKind == JsonValueKind.String ? property.GetString() : property.GetRawText();
-        if (string.IsNullOrWhiteSpace(raw) || !long.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var value))
-        {
-            return null;
-        }
-
-        return DateTimeOffset.FromUnixTimeMilliseconds(value).UtcDateTime;
-    }
-
-    private static DateTime? ReadNullableIsoDate(JsonElement element, string propertyName)
-    {
-        if (!element.TryGetProperty(propertyName, out var property))
-        {
-            return null;
-        }
-
-        var raw = property.ValueKind == JsonValueKind.String ? property.GetString() : property.GetRawText();
-        if (string.IsNullOrWhiteSpace(raw))
-        {
-            return null;
-        }
-
-        return DateTime.TryParse(raw, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var value)
-            ? value
-            : null;
-    }
-
     private abstract class MinuteAccumulatorBase(InstrumentDefinition instrument, DateTime minute)
     {
         protected InstrumentDefinition Instrument { get; } = instrument;
@@ -467,85 +317,27 @@ public sealed class MinuteAggregationService(
         private DateTime? _nextFundingUtc;
         private DateTime _lastUpdateUtc = minute;
 
-        public void Apply(JsonElement payload, DateTime eventTimestampUtc)
+        public void Apply(ExchangeTicker ticker)
         {
             lock (_gate)
             {
-                _lastPrice = ReadNullableDecimal(payload, "lastPrice") ?? _lastPrice;
-                _lastPrice = ReadNullableDecimal(payload, "last_price") ?? _lastPrice;
-                _markPrice = ReadNullableDecimal(payload, "markPrice") ?? _markPrice;
-                _markPrice = ReadNullableDecimal(payload, "mark_price") ?? _markPrice;
-                _indexPrice = ReadNullableDecimal(payload, "indexPrice") ?? _indexPrice;
-                _indexPrice = ReadNullableDecimal(payload, "index_price") ?? _indexPrice;
-                _bidPrice = ReadNullableDecimal(payload, "bid1Price") ?? _bidPrice;
-                _bidPrice = ReadNullableDecimal(payload, "best_bid_price") ?? _bidPrice;
-                _bidSize = ReadNullableDecimal(payload, "bid1Size") ?? _bidSize;
-                _bidSize = ReadNullableDecimal(payload, "best_bid_amount") ?? _bidSize;
-                _askPrice = ReadNullableDecimal(payload, "ask1Price") ?? _askPrice;
-                _askPrice = ReadNullableDecimal(payload, "best_ask_price") ?? _askPrice;
-                _askSize = ReadNullableDecimal(payload, "ask1Size") ?? _askSize;
-                _askSize = ReadNullableDecimal(payload, "best_ask_amount") ?? _askSize;
-                _openInterest = ReadNullableDecimal(payload, "openInterest") ?? _openInterest;
-                _openInterest = ReadNullableDecimal(payload, "open_interest") ?? _openInterest;
-                _openInterestValue = ReadNullableDecimal(payload, "openInterestValue") ?? _openInterestValue;
-                _volume24h = ReadNullableDecimal(payload, "volume24h") ?? _volume24h;
-                _volume24h = ReadNestedNullableDecimal(payload, "stats", "volume") ?? _volume24h;
-                _turnover24h = ReadNullableDecimal(payload, "turnover24h") ?? _turnover24h;
-                _turnover24h = ReadNestedNullableDecimal(payload, "stats", "volume_usd") ?? _turnover24h;
-                _fundingRate = ReadNullableDecimal(payload, "fundingRate") ?? _fundingRate;
-                _basisRate = ReadNullableDecimal(payload, "basisRate") ?? _basisRate;
-                _basisRateYear = ReadNullableDecimal(payload, "basisRateYear") ?? _basisRateYear;
-                _deliveryUtc = ReadNullableIsoDate(payload, "deliveryTime") ?? ReadNullableUnixMilliseconds(payload, "deliveryTime") ?? _deliveryUtc;
-                _nextFundingUtc = ReadNullableUnixMilliseconds(payload, "nextFundingTime") ?? _nextFundingUtc;
-                _lastUpdateUtc = eventTimestampUtc;
-            }
-        }
-
-        public void Apply(BybitLinearTickerUpdate payload, DateTime eventTimestampUtc)
-        {
-            lock (_gate)
-            {
-                _lastPrice = payload.LastPrice;
-                _markPrice = payload.MarkPrice;
-                _indexPrice = payload.IndexPrice;
-                _bidPrice = payload.BestBidPrice;
-                _bidSize = payload.BestBidQuantity;
-                _askPrice = payload.BestAskPrice;
-                _askSize = payload.BestAskQuantity;
-                _openInterest = payload.OpenInterest;
-                _openInterestValue = payload.OpenInterestValue ?? _openInterestValue;
-                _volume24h = payload.Volume24h;
-                _turnover24h = payload.Turnover24h;
-                _fundingRate = payload.FundingRate;
-                _basisRate = payload.BasisRate;
-                _basisRateYear = payload.BasisRateYear ?? _basisRateYear;
-                _deliveryUtc = payload.DeliveryTime ?? _deliveryUtc;
-                _nextFundingUtc = payload.NextFundingTime ?? _nextFundingUtc;
-                _lastUpdateUtc = eventTimestampUtc;
-            }
-        }
-
-        public void Apply(BybitLinearInverseTicker payload, DateTime eventTimestampUtc)
-        {
-            lock (_gate)
-            {
-                _lastPrice = payload.LastPrice;
-                _markPrice = payload.MarkPrice;
-                _indexPrice = payload.IndexPrice;
-                _bidPrice = payload.BestBidPrice;
-                _bidSize = payload.BestBidQuantity;
-                _askPrice = payload.BestAskPrice;
-                _askSize = payload.BestAskQuantity;
-                _openInterest = payload.OpenInterest;
-                _openInterestValue = payload.OpenInterestValue ?? _openInterestValue;
-                _volume24h = payload.Volume24h;
-                _turnover24h = payload.Turnover24h;
-                _fundingRate = payload.FundingRate;
-                _basisRate = payload.BasisRate;
-                _basisRateYear = payload.BasisRateYear ?? _basisRateYear;
-                _deliveryUtc = payload.DeliveryTime ?? _deliveryUtc;
-                _nextFundingUtc = payload.NextFundingTime ?? _nextFundingUtc;
-                _lastUpdateUtc = eventTimestampUtc;
+                _lastPrice = ticker.LastPrice ?? _lastPrice;
+                _markPrice = ticker.MarkPrice ?? _markPrice;
+                _indexPrice = ticker.IndexPrice ?? _indexPrice;
+                _bidPrice = ticker.BidPrice ?? _bidPrice;
+                _bidSize = ticker.BidSize ?? _bidSize;
+                _askPrice = ticker.AskPrice ?? _askPrice;
+                _askSize = ticker.AskSize ?? _askSize;
+                _openInterest = ticker.OpenInterest ?? _openInterest;
+                _openInterestValue = ticker.OpenInterestValue ?? _openInterestValue;
+                _volume24h = ticker.Volume24h ?? _volume24h;
+                _turnover24h = ticker.Turnover24h ?? _turnover24h;
+                _fundingRate = ticker.FundingRate ?? _fundingRate;
+                _basisRate = ticker.BasisRate ?? _basisRate;
+                _basisRateYear = ticker.BasisRateYear ?? _basisRateYear;
+                _deliveryUtc = ticker.DeliveryUtc ?? _deliveryUtc;
+                _nextFundingUtc = ticker.NextFundingTimeUtc ?? _nextFundingUtc;
+                _lastUpdateUtc = ticker.TimestampUtc.UtcDateTime;
             }
         }
 
@@ -611,109 +403,32 @@ public sealed class MinuteAggregationService(
         private decimal? _change24h;
         private DateTime _lastUpdateUtc = minute;
 
-        public void Apply(JsonElement payload, DateTime eventTimestampUtc)
+        public void Apply(ExchangeOptionTicker optionTicker)
         {
             lock (_gate)
             {
-                _bidPrice = ReadNullableDecimal(payload, "bidPrice") ?? ReadNullableDecimal(payload, "bid1Price") ?? _bidPrice;
-                _bidPrice = ReadNullableDecimal(payload, "bid_price") ?? ReadNullableDecimal(payload, "best_bid_price") ?? _bidPrice;
-                _bidSize = ReadNullableDecimal(payload, "bidSize") ?? ReadNullableDecimal(payload, "bid1Size") ?? _bidSize;
-                _bidSize = ReadNullableDecimal(payload, "best_bid_amount") ?? _bidSize;
-                _bidIv = ReadNullableDecimal(payload, "bidIv") ?? ReadNullableDecimal(payload, "bid1Iv") ?? _bidIv;
-                _bidIv = ReadNullableDecimal(payload, "bid_iv") ?? _bidIv;
-                _askPrice = ReadNullableDecimal(payload, "askPrice") ?? ReadNullableDecimal(payload, "ask1Price") ?? _askPrice;
-                _askPrice = ReadNullableDecimal(payload, "ask_price") ?? ReadNullableDecimal(payload, "best_ask_price") ?? _askPrice;
-                _askSize = ReadNullableDecimal(payload, "askSize") ?? ReadNullableDecimal(payload, "ask1Size") ?? _askSize;
-                _askSize = ReadNullableDecimal(payload, "best_ask_amount") ?? _askSize;
-                _askIv = ReadNullableDecimal(payload, "askIv") ?? ReadNullableDecimal(payload, "ask1Iv") ?? _askIv;
-                _askIv = ReadNullableDecimal(payload, "ask_iv") ?? _askIv;
-                _lastPrice = ReadNullableDecimal(payload, "lastPrice") ?? _lastPrice;
-                _lastPrice = ReadNullableDecimal(payload, "last_price") ?? _lastPrice;
-                _markPrice = ReadNullableDecimal(payload, "markPrice") ?? _markPrice;
-                _markPrice = ReadNullableDecimal(payload, "mark_price") ?? _markPrice;
-                _indexPrice = ReadNullableDecimal(payload, "indexPrice") ?? _indexPrice;
-                _indexPrice = ReadNullableDecimal(payload, "index_price") ?? _indexPrice;
-                _markIv = ReadNullableDecimal(payload, "markPriceIv") ?? ReadNullableDecimal(payload, "markIv") ?? _markIv;
-                _markIv = ReadNullableDecimal(payload, "mark_iv") ?? _markIv;
-                _underlyingPrice = ReadNullableDecimal(payload, "underlyingPrice") ?? _underlyingPrice;
-                _underlyingPrice = ReadNullableDecimal(payload, "underlying_price") ?? _underlyingPrice;
-                _openInterest = ReadNullableDecimal(payload, "openInterest") ?? _openInterest;
-                _openInterest = ReadNullableDecimal(payload, "open_interest") ?? _openInterest;
-                _volume24h = ReadNullableDecimal(payload, "volume24h") ?? _volume24h;
-                _volume24h = ReadNestedNullableDecimal(payload, "stats", "volume") ?? _volume24h;
-                _turnover24h = ReadNullableDecimal(payload, "turnover24h") ?? _turnover24h;
-                _turnover24h = ReadNestedNullableDecimal(payload, "stats", "volume_usd") ?? _turnover24h;
-                _totalVolume = ReadNullableDecimal(payload, "totalVolume") ?? _totalVolume;
-                _totalTurnover = ReadNullableDecimal(payload, "totalTurnover") ?? _totalTurnover;
-                _delta = ReadNullableDecimal(payload, "delta") ?? _delta;
-                _delta = ReadNestedNullableDecimal(payload, "greeks", "delta") ?? _delta;
-                _gamma = ReadNullableDecimal(payload, "gamma") ?? _gamma;
-                _gamma = ReadNestedNullableDecimal(payload, "greeks", "gamma") ?? _gamma;
-                _vega = ReadNullableDecimal(payload, "vega") ?? _vega;
-                _vega = ReadNestedNullableDecimal(payload, "greeks", "vega") ?? _vega;
-                _theta = ReadNullableDecimal(payload, "theta") ?? _theta;
-                _theta = ReadNestedNullableDecimal(payload, "greeks", "theta") ?? _theta;
-                _change24h = ReadNullableDecimal(payload, "change24h") ?? _change24h;
-                _change24h = ReadNestedNullableDecimal(payload, "stats", "price_change") ?? _change24h;
-                _lastUpdateUtc = eventTimestampUtc;
-            }
-        }
-
-        public void Apply(BybitOptionTickerUpdate payload, DateTime eventTimestampUtc)
-        {
-            lock (_gate)
-            {
-                _bidPrice = payload.BestBidPrice;
-                _bidSize = payload.BestBidQuantity;
-                _bidIv = payload.BidIv;
-                _askPrice = payload.BestAskPrice;
-                _askSize = payload.BestAskQuantity;
-                _askIv = payload.AskIv;
-                _lastPrice = payload.LastPrice;
-                _markPrice = payload.MarkPrice;
-                _indexPrice = payload.IndexPrice;
-                _markIv = payload.MarkPriceIv;
-                _underlyingPrice = payload.UnderlyingPrice;
-                _openInterest = payload.OpenInterest;
-                _volume24h = payload.Volume24h;
-                _turnover24h = payload.Turnover24h;
-                _totalVolume = payload.TotalVolume;
-                _totalTurnover = payload.TotalTurnover;
-                _delta = payload.Delta;
-                _gamma = payload.Gamma;
-                _vega = payload.Vega;
-                _theta = payload.Theta;
-                _change24h = payload.Change24h;
-                _lastUpdateUtc = eventTimestampUtc;
-            }
-        }
-
-        public void Apply(BybitOptionTicker payload, DateTime eventTimestampUtc)
-        {
-            lock (_gate)
-            {
-                _bidPrice = payload.BestBidPrice;
-                _bidSize = payload.BestBidQuantity;
-                _bidIv = payload.BestBidIv;
-                _askPrice = payload.BestAskPrice;
-                _askSize = payload.BestAskQuantity;
-                _askIv = payload.BestAskIv;
-                _lastPrice = payload.LastPrice;
-                _markPrice = payload.MarkPrice;
-                _indexPrice = payload.IndexPrice;
-                _markIv = payload.MarkIv;
-                _underlyingPrice = payload.UnderlyingPrice;
-                _openInterest = payload.OpenInterest;
-                _volume24h = payload.Volume24h;
-                _turnover24h = payload.Turnover24h;
-                _totalVolume = payload.TotalVolume;
-                _totalTurnover = payload.TotalTurnover;
-                _delta = payload.Delta;
-                _gamma = payload.Gamma;
-                _vega = payload.Vega;
-                _theta = payload.Theta;
-                _change24h = payload.Change24h;
-                _lastUpdateUtc = eventTimestampUtc;
+                _bidPrice = optionTicker.BidPrice ?? _bidPrice;
+                _bidSize = optionTicker.BidSize ?? _bidSize;
+                _bidIv = optionTicker.BidIv ?? _bidIv;
+                _askPrice = optionTicker.AskPrice ?? _askPrice;
+                _askSize = optionTicker.AskSize ?? _askSize;
+                _askIv = optionTicker.AskIv ?? _askIv;
+                _lastPrice = optionTicker.LastPrice ?? _lastPrice;
+                _markPrice = optionTicker.MarkPrice ?? _markPrice;
+                _indexPrice = optionTicker.IndexPrice ?? _indexPrice;
+                _markIv = optionTicker.MarkIv ?? _markIv;
+                _underlyingPrice = optionTicker.UnderlyingPrice ?? _underlyingPrice;
+                _openInterest = optionTicker.OpenInterest ?? _openInterest;
+                _volume24h = optionTicker.Volume24h ?? _volume24h;
+                _turnover24h = optionTicker.Turnover24h ?? _turnover24h;
+                _totalVolume = optionTicker.TotalVolume ?? _totalVolume;
+                _totalTurnover = optionTicker.TotalTurnover ?? _totalTurnover;
+                _delta = optionTicker.Delta ?? _delta;
+                _gamma = optionTicker.Gamma ?? _gamma;
+                _vega = optionTicker.Vega ?? _vega;
+                _theta = optionTicker.Theta ?? _theta;
+                _change24h = optionTicker.Change24h ?? _change24h;
+                _lastUpdateUtc = optionTicker.TimestampUtc.UtcDateTime;
             }
         }
 
