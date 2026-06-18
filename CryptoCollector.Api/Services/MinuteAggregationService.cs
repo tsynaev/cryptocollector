@@ -12,9 +12,11 @@ public sealed class MinuteAggregationService(
     IOptions<BybitCollectorOptions> options,
     ILogger<MinuteAggregationService> logger) : BackgroundService, IMarketDataSink
 {
+    private static readonly TimeSpan RecentTradeIdWindow = TimeSpan.FromSeconds(10);
     private readonly ConcurrentDictionary<string, TradeRecord> _tradeRows = new(StringComparer.OrdinalIgnoreCase);
-    private readonly ConcurrentDictionary<string, byte> _seenTradeIds = new(StringComparer.OrdinalIgnoreCase);
-    private readonly ConcurrentQueue<SeenTradeMarker> _seenTradeIdQueue = new();
+    private readonly ConcurrentDictionary<string, DateTime> _latestPersistedTradeBySymbol = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, byte> _recentSeenTradeIds = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentQueue<SeenTradeMarker> _recentSeenTradeIdQueue = new();
     private readonly ConcurrentDictionary<string, TickerAccumulator> _tickerBars = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, OptionChainAccumulator> _optionBars = new(StringComparer.OrdinalIgnoreCase);
     private DateTime? _lastReportedMinute;
@@ -32,12 +34,29 @@ public sealed class MinuteAggregationService(
             return;
         }
 
+        var symbolKey = $"{instrument.Exchange}|{instrument.Symbol}";
         var dedupeKey = $"{instrument.Exchange}|{instrument.Symbol}|{trade.TradeId}";
-        if (!_seenTradeIds.TryAdd(dedupeKey, 0))
+
+        if (_latestPersistedTradeBySymbol.TryGetValue(symbolKey, out var latestPersistedTimestamp))
+        {
+            if (timestamp < latestPersistedTimestamp)
+            {
+                return;
+            }
+
+            if (timestamp == latestPersistedTimestamp && !_recentSeenTradeIds.TryAdd(dedupeKey, 0))
+            {
+                return;
+            }
+        }
+        else if (!_recentSeenTradeIds.TryAdd(dedupeKey, 0))
         {
             return;
         }
-        _seenTradeIdQueue.Enqueue(new SeenTradeMarker(dedupeKey, timestamp));
+
+        _latestPersistedTradeBySymbol.AddOrUpdate(symbolKey, timestamp, (_, current) => current > timestamp ? current : timestamp);
+        _recentSeenTradeIds.TryAdd(dedupeKey, 0);
+        _recentSeenTradeIdQueue.Enqueue(new SeenTradeMarker(dedupeKey, timestamp));
 
         var key = $"{instrument.Exchange}|{instrument.Symbol}|{trade.TradeId}|{timestamp:O}";
         var tradeRecord = new TradeRecord
@@ -133,12 +152,35 @@ public sealed class MinuteAggregationService(
                 symbol: null,
                 cancellationToken);
 
+            var latestPerSymbol = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+
             foreach (var row in rows)
             {
-                var dedupeKey = $"{row.Exchange}|{row.Symbol}|{row.TradeId}";
-                if (_seenTradeIds.TryAdd(dedupeKey, 0))
+                var symbolKey = $"{row.Exchange}|{row.Symbol}";
+                if (!latestPerSymbol.TryGetValue(symbolKey, out var current) || row.Date > current)
                 {
-                    _seenTradeIdQueue.Enqueue(new SeenTradeMarker(dedupeKey, row.Date));
+                    latestPerSymbol[symbolKey] = row.Date;
+                }
+            }
+
+            foreach (var entry in latestPerSymbol)
+            {
+                _latestPersistedTradeBySymbol[entry.Key] = entry.Value;
+            }
+
+            foreach (var row in rows)
+            {
+                var symbolKey = $"{row.Exchange}|{row.Symbol}";
+                if (!latestPerSymbol.TryGetValue(symbolKey, out var latestForSymbol) ||
+                    row.Date < latestForSymbol - RecentTradeIdWindow)
+                {
+                    continue;
+                }
+
+                var dedupeKey = $"{row.Exchange}|{row.Symbol}|{row.TradeId}";
+                if (_recentSeenTradeIds.TryAdd(dedupeKey, 0))
+                {
+                    _recentSeenTradeIdQueue.Enqueue(new SeenTradeMarker(dedupeKey, row.Date));
                 }
             }
         }
@@ -163,11 +205,25 @@ public sealed class MinuteAggregationService(
                 tradeRows.Count,
                 tickerRows.Count,
                 optionRows.Count);
+
+            foreach (var latestTrade in tradeRows
+                         .GroupBy(static x => $"{x.Exchange}|{x.Symbol}", StringComparer.OrdinalIgnoreCase)
+                         .Select(static group => new
+                         {
+                             SymbolKey = group.Key,
+                             LatestTimestamp = group.Max(static x => x.Date)
+                         }))
+            {
+                _latestPersistedTradeBySymbol.AddOrUpdate(
+                    latestTrade.SymbolKey,
+                    latestTrade.LatestTimestamp,
+                    (_, current) => current > latestTrade.LatestTimestamp ? current : latestTrade.LatestTimestamp);
+            }
         }
 
         if (!includeCurrentMinute)
         {
-            CleanupSeenTradeIds(cutoff.AddHours(-12));
+            CleanupSeenTradeIds(cutoff - RecentTradeIdWindow);
 
             var reportedMinute = cutoff.AddMinutes(-1);
             if (_lastReportedMinute != reportedMinute)
@@ -203,14 +259,14 @@ public sealed class MinuteAggregationService(
 
     private void CleanupSeenTradeIds(DateTime thresholdUtc)
     {
-        while (_seenTradeIdQueue.TryPeek(out var marker) && marker.TimestampUtc < thresholdUtc)
+        while (_recentSeenTradeIdQueue.TryPeek(out var marker) && marker.TimestampUtc < thresholdUtc)
         {
-            if (!_seenTradeIdQueue.TryDequeue(out marker))
+            if (!_recentSeenTradeIdQueue.TryDequeue(out marker))
             {
                 continue;
             }
 
-            _seenTradeIds.TryRemove(marker.Key, out _);
+            _recentSeenTradeIds.TryRemove(marker.Key, out _);
         }
     }
 
@@ -312,15 +368,15 @@ public sealed class MinuteAggregationService(
     {
         var counts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
 
-        foreach (var key in _seenTradeIds.Keys)
+        foreach (var seenTradeKey in _recentSeenTradeIds.Keys)
         {
-            var separatorIndex = key.IndexOf('|');
+            var separatorIndex = seenTradeKey.IndexOf('|');
             if (separatorIndex <= 0)
             {
                 continue;
             }
 
-            var exchange = key[..separatorIndex];
+            var exchange = seenTradeKey[..separatorIndex];
             counts.TryGetValue(exchange, out var count);
             counts[exchange] = count + 1;
         }
