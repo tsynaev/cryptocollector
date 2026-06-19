@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Net.Http.Headers;
 using System.Reflection;
 using System.Text.Encodings.Web;
 using System.Threading.Channels;
@@ -12,7 +13,7 @@ public sealed class TelegramMessageQueue : BackgroundService, IMessageQueue
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly TelegramOptions _options;
     private readonly ILogger<TelegramMessageQueue> _logger;
-    private readonly Channel<string> _channel;
+    private readonly Channel<OutboundMessage> _channel;
     private int _startupMessageQueued;
 
     public TelegramMessageQueue(
@@ -24,7 +25,7 @@ public sealed class TelegramMessageQueue : BackgroundService, IMessageQueue
         _httpClientFactory = httpClientFactory;
         _options = options.Value;
         _logger = logger;
-        _channel = Channel.CreateBounded<string>(new BoundedChannelOptions(Math.Max(1, _options.QueueCapacity))
+        _channel = Channel.CreateBounded<OutboundMessage>(new BoundedChannelOptions(Math.Max(1, _options.QueueCapacity))
         {
             SingleReader = true,
             SingleWriter = false,
@@ -34,7 +35,7 @@ public sealed class TelegramMessageQueue : BackgroundService, IMessageQueue
         applicationLifetime.ApplicationStarted.Register(EnqueueStartupMessage);
     }
 
-    public bool TryEnqueue(string message)
+    public bool TryEnqueue(OutboundMessage message)
     {
         if (!_options.Enabled || string.IsNullOrWhiteSpace(_options.BotToken) || string.IsNullOrWhiteSpace(_options.ChatId))
         {
@@ -64,18 +65,13 @@ public sealed class TelegramMessageQueue : BackgroundService, IMessageQueue
         _logger.LogInformation("Telegram sender started.");
 
         var client = _httpClientFactory.CreateClient(nameof(TelegramMessageQueue));
-        var endpoint = $"https://api.telegram.org/bot{_options.BotToken}/sendMessage";
-
         await foreach (var message in _channel.Reader.ReadAllAsync(stoppingToken))
         {
             try
             {
-                var response = await client.PostAsJsonAsync(endpoint, new
-                {
-                    chat_id = _options.ChatId,
-                    text = message,
-                    parse_mode = "HTML"
-                }, cancellationToken: stoppingToken);
+                using var response = message.PhotoBytes is null
+                    ? await SendTextMessageAsync(client, message, stoppingToken)
+                    : await SendPhotoMessageAsync(client, message, stoppingToken);
 
                 if (!response.IsSuccessStatusCode)
                 {
@@ -105,7 +101,7 @@ public sealed class TelegramMessageQueue : BackgroundService, IMessageQueue
             return;
         }
 
-        if (!TryEnqueue(BuildStartupMessage()))
+        if (!TryEnqueue(new OutboundMessage(BuildStartupMessage())))
         {
             _logger.LogWarning("Failed to enqueue Telegram startup message.");
         }
@@ -120,12 +116,44 @@ public sealed class TelegramMessageQueue : BackgroundService, IMessageQueue
         var assembly = Assembly.GetEntryAssembly();
         var version = assembly?.GetName().Version?.ToString() ?? "unknown";
         var machineName = HtmlEncoder.Default.Encode(Environment.MachineName);
-        var startedAt = DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture);
 
         return string.Join('\n', [
             "<b>CryptoCollector started</b>",
             $"host=<code>{machineName}</code>",
             $"version=<code>{HtmlEncoder.Default.Encode(version)}</code>"
         ]);
+    }
+
+    private Task<HttpResponseMessage> SendTextMessageAsync(
+        HttpClient client,
+        OutboundMessage message,
+        CancellationToken cancellationToken)
+    {
+        var endpoint = $"https://api.telegram.org/bot{_options.BotToken}/sendMessage";
+
+        return client.PostAsJsonAsync(endpoint, new
+        {
+            chat_id = _options.ChatId,
+            text = message.Caption,
+            parse_mode = "HTML"
+        }, cancellationToken: cancellationToken);
+    }
+
+    private Task<HttpResponseMessage> SendPhotoMessageAsync(
+        HttpClient client,
+        OutboundMessage message,
+        CancellationToken cancellationToken)
+    {
+        var endpoint = $"https://api.telegram.org/bot{_options.BotToken}/sendPhoto";
+        var content = new MultipartFormDataContent();
+        content.Add(new StringContent(_options.ChatId), "chat_id");
+        content.Add(new StringContent(message.Caption), "caption");
+        content.Add(new StringContent("HTML"), "parse_mode");
+
+        var photoContent = new ByteArrayContent(message.PhotoBytes!);
+        photoContent.Headers.ContentType = new MediaTypeHeaderValue("image/png");
+        content.Add(photoContent, "photo", message.PhotoFileName ?? "chart.png");
+
+        return client.PostAsync(endpoint, content, cancellationToken);
     }
 }

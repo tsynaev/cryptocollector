@@ -15,9 +15,12 @@ public sealed class BlockTradeAlertService(
     ServiceStateStore stateStore,
     IOptions<BlockTradesAlertOptions> options,
     IMessageQueue messageQueue,
+    PositionPnlChartRenderer chartRenderer,
+    BlackScholesPricer blackScholesPricer,
     ILogger<BlockTradeAlertService> logger) : BackgroundService
 {
     private const string StateKey = "block-trade-alert";
+    private const int TelegramCaptionLimit = 1024;
     private static readonly TimeSpan PersistInterval = TimeSpan.FromSeconds(30);
     private static readonly string[] Exchanges = ["bybit", "deribit"];
 
@@ -184,6 +187,8 @@ public sealed class BlockTradeAlertService(
             price,
             trade.MarkPrice,
             trade.IndexPrice,
+            trade.Iv,
+            trade.MarkIv,
             price * quantity,
             groupId,
             groupType,
@@ -251,6 +256,8 @@ public sealed class BlockTradeAlertService(
             trade.Price,
             trade.MarkPrice,
             trade.IndexPrice,
+            trade.Iv,
+            trade.MarkIv,
             trade.Notional,
             groupId,
             groupType,
@@ -353,7 +360,9 @@ public sealed class BlockTradeAlertService(
             }
 
             var message = await FormatBlockTradeMessageAsync(group, cancellationToken);
-            if (messageQueue.TryEnqueue(message))
+            var caption = TrimCaption(message);
+            var enqueued = await TryEnqueueAlertAsync(group, caption, cancellationToken);
+            if (enqueued)
             {
                 logger.LogInformation(
                     "Enqueued block trade alert. Exchange={Exchange}, GroupType={GroupType}, GroupId={GroupId}, Legs={LegCount}, TotalQuantity={TotalQuantity}, TotalUsdNotional={TotalUsdNotional}.",
@@ -364,6 +373,34 @@ public sealed class BlockTradeAlertService(
                     group.TotalQuantity,
                     totalUsdNotional);
             }
+        }
+    }
+
+    private async Task<bool> TryEnqueueAlertAsync(
+        BlockTradeGroup group,
+        string caption,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var chart = await BuildPositionPnlChartAsync(group, cancellationToken);
+            if (chart is null)
+            {
+                return messageQueue.TryEnqueue(new OutboundMessage(caption));
+            }
+
+            var photoBytes = chartRenderer.Render(chart);
+            return messageQueue.TryEnqueue(new OutboundMessage(caption, photoBytes, "block-trade-pnl.png"));
+        }
+        catch (Exception exception)
+        {
+            logger.LogWarning(
+                exception,
+                "Failed to render block trade chart. Exchange={Exchange}, GroupId={GroupId}, GroupType={GroupType}. Falling back to text alert.",
+                group.Exchange,
+                group.GroupId,
+                group.GroupType);
+            return messageQueue.TryEnqueue(new OutboundMessage(caption));
         }
     }
 
@@ -461,13 +498,174 @@ public sealed class BlockTradeAlertService(
             return $"{side} {quantity} {optionSide} {strike} @ {price} {settleAsset} ({premium} {settleAsset})";
         }
 
-        if (leg.Exchange.Equals("deribit", StringComparison.OrdinalIgnoreCase) && leg.Price > 0)
+        var displayQuantityValue = ResolveDisplayQuantity(leg);
+        if (displayQuantityValue != leg.Quantity)
         {
-            var displayQuantity = (leg.Quantity / leg.Price).ToString("0.####", CultureInfo.InvariantCulture);
+            var displayQuantity = displayQuantityValue.ToString("0.####", CultureInfo.InvariantCulture);
             return $"{side} {displayQuantity} {leg.Symbol} @ {price}";
         }
 
         return $"{side} {quantity} {leg.Symbol} @ {price}";
+    }
+
+    private async Task<PositionPnlChart?> BuildPositionPnlChartAsync(
+        BlockTradeGroup group,
+        CancellationToken cancellationToken)
+    {
+        var orderedLegs = group.Legs
+            .OrderBy(static x => x.TimestampUtc)
+            .ThenBy(static x => x.Symbol, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (orderedLegs.Length == 0)
+        {
+            return null;
+        }
+
+        var evaluatedLegs = await EvaluateLegsAsync(orderedLegs, cancellationToken);
+        var firstLeg = evaluatedLegs[0].Leg;
+        var currentSpot = evaluatedLegs
+            .Select(static x => x.UnderlyingPrice)
+            .FirstOrDefault(static x => x is > 0);
+        var strikeValues = orderedLegs
+            .Where(static x => x.StrikePrice is > 0)
+            .Select(static x => x.StrikePrice!.Value)
+            .ToArray();
+        var referenceSpot = currentSpot
+            ?? (strikeValues.Length > 0 ? strikeValues.Average() : 0m);
+        if (referenceSpot <= 0)
+        {
+            return null;
+        }
+
+        var minReference = strikeValues.Length > 0
+            ? Math.Min(strikeValues.Min(), referenceSpot)
+            : referenceSpot;
+        var maxReference = strikeValues.Length > 0
+            ? Math.Max(strikeValues.Max(), referenceSpot)
+            : referenceSpot;
+        var xMin = Math.Max(1m, minReference * 0.5m);
+        var xMax = Math.Max(xMin + 1m, maxReference * 1.5m);
+        const int pointCount = 241;
+        var prices = new decimal[pointCount];
+        var expiryPnl = new decimal[pointCount];
+        var currentPnl = new decimal[pointCount];
+        var displayCurrency = ResolveDisplayCurrency(firstLeg);
+
+        for (var index = 0; index < pointCount; index++)
+        {
+            var price = xMin + (xMax - xMin) * index / (pointCount - 1);
+            prices[index] = price;
+            expiryPnl[index] = ResolveGroupPnlAtExpiry(evaluatedLegs, price);
+            currentPnl[index] = ResolveGroupPnlAtCurrentTime(evaluatedLegs, price);
+        }
+
+        return new PositionPnlChart(
+            displayCurrency,
+            currentSpot ?? referenceSpot,
+            prices,
+            expiryPnl,
+            currentPnl,
+            DateTime.UtcNow);
+    }
+
+    private async Task<IReadOnlyList<EvaluatedBlockTradeLeg>> EvaluateLegsAsync(
+        IReadOnlyList<BlockTradeLeg> legs,
+        CancellationToken cancellationToken)
+    {
+        var evaluated = new EvaluatedBlockTradeLeg[legs.Count];
+
+        for (var index = 0; index < legs.Count; index++)
+        {
+            var leg = legs[index];
+            var underlyingPrice = await ResolveUnderlyingPriceAsync(leg, cancellationToken);
+            var premiumUsd = await ResolveLegUsdNotionalAsync(leg, underlyingPrice);
+            var volatility = ResolveVolatility(leg);
+            var timeToExpiryYears = ResolveTimeToExpiryYears(leg);
+
+            evaluated[index] = new EvaluatedBlockTradeLeg(
+                leg,
+                ResolveDisplayQuantity(leg),
+                underlyingPrice,
+                premiumUsd,
+                volatility,
+                timeToExpiryYears);
+        }
+
+        return evaluated;
+    }
+
+    private decimal ResolveGroupPnlAtExpiry(
+        IReadOnlyList<EvaluatedBlockTradeLeg> legs,
+        decimal underlyingPrice)
+    {
+        decimal total = 0m;
+
+        foreach (var leg in legs)
+        {
+            total += ResolveLegPnlAtExpiry(leg, underlyingPrice);
+        }
+
+        return total;
+    }
+
+    private decimal ResolveGroupPnlAtCurrentTime(
+        IReadOnlyList<EvaluatedBlockTradeLeg> legs,
+        decimal underlyingPrice)
+    {
+        decimal total = 0m;
+
+        foreach (var leg in legs)
+        {
+            total += ResolveLegPnlAtCurrentTime(leg, underlyingPrice);
+        }
+
+        return total;
+    }
+
+    private decimal ResolveLegPnlAtExpiry(EvaluatedBlockTradeLeg leg, decimal underlyingPrice)
+    {
+        var sideSign = leg.Leg.Side.Equals("buy", StringComparison.OrdinalIgnoreCase) ? 1m : -1m;
+
+        if (leg.Leg.MarketType.Equals("option", StringComparison.OrdinalIgnoreCase))
+        {
+            if (leg.Leg.StrikePrice is null || string.IsNullOrWhiteSpace(leg.Leg.OptionSide))
+            {
+                return 0m;
+            }
+
+            var intrinsicPerContract = blackScholesPricer.IntrinsicValue(
+                leg.Leg.OptionSide.Equals("call", StringComparison.OrdinalIgnoreCase),
+                underlyingPrice,
+                leg.Leg.StrikePrice.Value);
+
+            return sideSign * ((intrinsicPerContract * leg.DisplayQuantity) - leg.PremiumUsd);
+        }
+
+        return sideSign * leg.DisplayQuantity * (underlyingPrice - leg.Leg.Price);
+    }
+
+    private decimal ResolveLegPnlAtCurrentTime(EvaluatedBlockTradeLeg leg, decimal underlyingPrice)
+    {
+        var sideSign = leg.Leg.Side.Equals("buy", StringComparison.OrdinalIgnoreCase) ? 1m : -1m;
+
+        if (leg.Leg.MarketType.Equals("option", StringComparison.OrdinalIgnoreCase))
+        {
+            if (leg.Leg.StrikePrice is null || string.IsNullOrWhiteSpace(leg.Leg.OptionSide))
+            {
+                return 0m;
+            }
+
+            var optionValue = blackScholesPricer.Price(
+                leg.Leg.OptionSide.Equals("call", StringComparison.OrdinalIgnoreCase),
+                underlyingPrice,
+                leg.Leg.StrikePrice.Value,
+                leg.TimeToExpiryYears,
+                leg.Volatility);
+
+            return sideSign * ((optionValue * leg.DisplayQuantity) - leg.PremiumUsd);
+        }
+
+        return sideSign * leg.DisplayQuantity * (underlyingPrice - leg.Leg.Price);
     }
 
     private async Task<ConvertedOptionAmounts?> TryConvertOptionAmountsAsync(BlockTradeLeg leg, CancellationToken cancellationToken)
@@ -508,36 +706,41 @@ public sealed class BlockTradeAlertService(
 
     private async Task<decimal> ResolveLegUsdNotionalAsync(BlockTradeLeg leg, CancellationToken cancellationToken)
     {
+        return await ResolveLegUsdNotionalAsync(
+            leg,
+            await ResolveUnderlyingPriceAsync(leg, cancellationToken));
+    }
+
+    private Task<decimal> ResolveLegUsdNotionalAsync(BlockTradeLeg leg, decimal? underlyingPrice)
+    {
         if (leg.MarketType.Equals("option", StringComparison.OrdinalIgnoreCase))
         {
             if (IsUsdLike(leg.SettleAsset) || IsUsdLike(leg.QuoteAsset))
             {
-                return Math.Abs(leg.Notional);
+                return Task.FromResult(Math.Abs(leg.Notional));
             }
 
             if (IsPriceQuotedInBaseAsset(leg))
             {
-                var underlyingPrice = await ResolveUnderlyingPriceAsync(leg, cancellationToken);
-                return underlyingPrice is > 0 ? Math.Abs(leg.Notional * underlyingPrice.Value) : 0m;
+                return Task.FromResult(underlyingPrice is > 0 ? Math.Abs(leg.Notional * underlyingPrice.Value) : 0m);
             }
 
-            return 0m;
+            return Task.FromResult(0m);
         }
 
         if (leg.Amount is not null && IsUsdLike(leg.QuoteAsset))
         {
-            return Math.Abs(leg.Amount.Value);
+            return Task.FromResult(Math.Abs(leg.Amount.Value));
         }
 
         if (IsUsdLike(leg.QuoteAsset) || IsUsdLike(leg.SettleAsset))
         {
-            return Math.Abs(leg.Price * ResolveDisplayQuantity(leg));
+            return Task.FromResult(Math.Abs(leg.Price * ResolveDisplayQuantity(leg)));
         }
 
-        var assetPrice = await ResolveUnderlyingPriceAsync(leg, cancellationToken);
-        return assetPrice is > 0
-            ? Math.Abs(ResolveDisplayQuantity(leg) * assetPrice.Value)
-            : 0m;
+        return Task.FromResult(underlyingPrice is > 0
+            ? Math.Abs(ResolveDisplayQuantity(leg) * underlyingPrice.Value)
+            : 0m);
     }
 
     private async Task<decimal?> ResolveUnderlyingPriceAsync(BlockTradeLeg leg, CancellationToken cancellationToken)
@@ -631,6 +834,26 @@ public sealed class BlockTradeAlertService(
         return "USDT";
     }
 
+    private static string ResolveDisplayCurrency(BlockTradeLeg leg)
+    {
+        if (IsPriceQuotedInBaseAsset(leg))
+        {
+            return ResolveStableDisplayCurrency(leg);
+        }
+
+        if (IsUsdLike(leg.QuoteAsset))
+        {
+            return leg.QuoteAsset.ToUpperInvariant();
+        }
+
+        if (IsUsdLike(leg.SettleAsset))
+        {
+            return leg.SettleAsset.ToUpperInvariant();
+        }
+
+        return ResolveStableDisplayCurrency(leg);
+    }
+
     private static bool IsPriceQuotedInBaseAsset(BlockTradeLeg leg) =>
         leg.SettleAsset.Equals(leg.BaseAsset, StringComparison.OrdinalIgnoreCase);
 
@@ -654,6 +877,56 @@ public sealed class BlockTradeAlertService(
         }
 
         return leg.Quantity;
+    }
+
+    private decimal ResolveVolatility(BlockTradeLeg leg) =>
+        blackScholesPricer.NormalizeVolatility(leg.MarkIv ?? leg.Iv);
+
+    private static decimal ResolveTimeToExpiryYears(BlockTradeLeg leg)
+    {
+        if (leg.ExpiryUtc is null)
+        {
+            return 0m;
+        }
+
+        var timeToExpiry = leg.ExpiryUtc.Value - DateTime.UtcNow;
+        if (timeToExpiry <= TimeSpan.Zero)
+        {
+            return 0m;
+        }
+
+        return Math.Max((decimal)timeToExpiry.TotalDays / 365m, 0.0001m);
+    }
+
+    private static string TrimCaption(string message)
+    {
+        if (message.Length <= TelegramCaptionLimit)
+        {
+            return message;
+        }
+
+        var lines = message.Split('\n');
+        var buffer = new List<string>(lines.Length);
+        var currentLength = 0;
+
+        foreach (var line in lines)
+        {
+            var additionalLength = line.Length + (buffer.Count > 0 ? 1 : 0);
+            if (currentLength + additionalLength > TelegramCaptionLimit - 3)
+            {
+                break;
+            }
+
+            buffer.Add(line);
+            currentLength += additionalLength;
+        }
+
+        if (buffer.Count == 0)
+        {
+            return message[..Math.Min(message.Length, TelegramCaptionLimit - 3)] + "...";
+        }
+
+        return string.Join('\n', buffer) + "...";
     }
 
     private static bool MatchesUnderlyingSnapshot(OptionChainMinuteBar row, BlockTradeLeg leg, bool requireTimestampMatch) =>
@@ -853,10 +1126,20 @@ public sealed class BlockTradeAlertService(
         decimal Price,
         decimal? MarkPrice,
         decimal? IndexPrice,
+        decimal? Iv,
+        decimal? MarkIv,
         decimal Notional,
         string GroupId,
         string GroupType,
         DateTime TimestampUtc);
+
+    private sealed record EvaluatedBlockTradeLeg(
+        BlockTradeLeg Leg,
+        decimal DisplayQuantity,
+        decimal? UnderlyingPrice,
+        decimal PremiumUsd,
+        decimal Volatility,
+        decimal TimeToExpiryYears);
 
     private sealed record ConvertedOptionAmounts(string UnitPriceText, string TotalPremiumValueText, string TotalPremiumText);
     private sealed record PendingTrade(InstrumentDefinition Instrument, ExchangeTrade Trade, bool UpdateCursor);

@@ -2,5 +2,5 @@ namespace CryptoCollector.Api.Services;
 
 public interface IMessageQueue
 {
-    bool TryEnqueue(string message);
+    bool TryEnqueue(OutboundMessage message);
 }

@@ -19,6 +19,8 @@ builder.Services.AddSwaggerGen();
 
 builder.Services.AddSingleton<DailyParquetStore>();
 builder.Services.AddSingleton<ServiceStateStore>();
+builder.Services.AddSingleton<BlackScholesPricer>();
+builder.Services.AddSingleton<PositionPnlChartRenderer>();
 builder.Services.AddHttpClient(nameof(TelegramMessageQueue));
 builder.Services.AddSingleton<TelegramMessageQueue>();
 builder.Services.AddSingleton<IMessageQueue>(sp => sp.GetRequiredService<TelegramMessageQueue>());
