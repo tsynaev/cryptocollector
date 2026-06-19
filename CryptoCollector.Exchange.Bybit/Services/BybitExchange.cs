@@ -26,32 +26,80 @@ public sealed class BybitExchange(
     public Task<IReadOnlyList<InstrumentDefinition>> GetTrackedInstrumentsAsync(CancellationToken cancellationToken) =>
         apiClient.GetTrackedInstrumentsAsync(_options.BaseAsset, _options.QuoteAsset, cancellationToken);
 
-    public async Task<ExchangeBootstrapBatch> BootstrapAsync(IReadOnlyList<InstrumentDefinition> instruments, DateTime? catchUpFromUtc, CancellationToken cancellationToken) =>
-        new()
+    public async IAsyncEnumerable<ExchangeTradeMessage> StreamTradesSinceAsync(
+        IReadOnlyList<InstrumentDefinition> instruments,
+        DateTime? catchUpFromUtc,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        foreach (var instrument in instruments.Where(static x => x.Category.Equals("linear", StringComparison.OrdinalIgnoreCase)))
         {
-            Tickers = await BootstrapLinearTickersAsync(instruments, cancellationToken),
-            Trades = (await BootstrapLinearTradesAsync(instruments, catchUpFromUtc, cancellationToken))
-                .Concat(await BootstrapOptionTradesAsync(instruments, catchUpFromUtc, cancellationToken))
-                .ToArray()
-        };
+            var trades = await apiClient.GetRecentLinearTradesAsync(instrument.Symbol, cancellationToken);
+            foreach (var trade in trades)
+            {
+                if (catchUpFromUtc is not null && trade.Timestamp <= catchUpFromUtc.Value)
+                {
+                    continue;
+                }
 
-    public async Task<IReadOnlyList<ExchangeOptionMessage>> PollOptionChainSnapshotsAsync(IReadOnlyList<InstrumentDefinition> instruments, CancellationToken cancellationToken)
+                yield return new ExchangeTradeMessage(instrument, MapTrade(trade));
+            }
+        }
+
+        var trackedOptionSymbols = instruments
+            .Where(static x => x.Category.Equals("option", StringComparison.OrdinalIgnoreCase))
+            .ToDictionary(static x => x.Symbol, StringComparer.OrdinalIgnoreCase);
+        var optionTrades = await apiClient.GetRecentOptionTradesAsync(_options.BaseAsset, cancellationToken);
+
+        foreach (var trade in optionTrades)
+        {
+            if (!trackedOptionSymbols.TryGetValue(trade.Symbol, out var instrument))
+            {
+                continue;
+            }
+
+            if (catchUpFromUtc is not null && trade.Timestamp <= catchUpFromUtc.Value)
+            {
+                continue;
+            }
+
+            yield return new ExchangeTradeMessage(instrument, MapTrade(trade));
+        }
+    }
+
+    public async IAsyncEnumerable<ExchangeTickerMessage> StreamTickersSnapshotAsync(
+        IReadOnlyList<InstrumentDefinition> instruments,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        var trackedSymbols = instruments
+            .Where(static x => x.Category.Equals("linear", StringComparison.OrdinalIgnoreCase))
+            .ToDictionary(static x => x.Symbol, StringComparer.OrdinalIgnoreCase);
+        var tickers = await apiClient.GetLinearTickersAsync(_options.BaseAsset, cancellationToken);
+        var timestamp = DateTimeOffset.UtcNow;
+
+        foreach (var ticker in tickers)
+        {
+            if (trackedSymbols.TryGetValue(ticker.Symbol, out var instrument))
+            {
+                yield return new ExchangeTickerMessage(instrument, BybitApiClient.MapLinearTicker(ticker, timestamp));
+            }
+        }
+    }
+
+    public async IAsyncEnumerable<ExchangeOptionMessage> StreamOptionChainSnapshotAsync(
+        IReadOnlyList<InstrumentDefinition> instruments,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         var trackedSymbols = instruments
             .Where(static x => x.Category.Equals("option", StringComparison.OrdinalIgnoreCase))
             .ToDictionary(static x => x.Symbol, StringComparer.OrdinalIgnoreCase);
-        var result = new List<ExchangeOptionMessage>();
-
         var snapshots = await apiClient.GetOptionChainSnapshotsAsync(cancellationToken);
         foreach (var snapshot in snapshots)
         {
             if (trackedSymbols.TryGetValue(snapshot.Symbol, out var instrument))
             {
-                result.Add(new ExchangeOptionMessage(instrument, snapshot.Ticker));
+                yield return new ExchangeOptionMessage(instrument, snapshot.Ticker);
             }
         }
-
-        return result;
     }
 
     public async IAsyncEnumerable<ExchangeDataMessage> StreamAsync(
@@ -163,72 +211,6 @@ public sealed class BybitExchange(
 
             writer.TryComplete();
         }
-    }
-
-    private async Task<IReadOnlyList<ExchangeTickerMessage>> BootstrapLinearTickersAsync(IReadOnlyList<InstrumentDefinition> instruments, CancellationToken cancellationToken)
-    {
-        var trackedSymbols = instruments
-            .Where(static x => x.Category.Equals("linear", StringComparison.OrdinalIgnoreCase))
-            .ToDictionary(static x => x.Symbol, StringComparer.OrdinalIgnoreCase);
-        var result = new List<ExchangeTickerMessage>();
-
-        var tickers = await apiClient.GetLinearTickersAsync(_options.BaseAsset, cancellationToken);
-        var timestamp = DateTimeOffset.UtcNow;
-
-        foreach (var ticker in tickers)
-        {
-            if (trackedSymbols.TryGetValue(ticker.Symbol, out var instrument))
-            {
-                result.Add(new ExchangeTickerMessage(instrument, BybitApiClient.MapLinearTicker(ticker, timestamp)));
-            }
-        }
-
-        return result;
-    }
-
-    private async Task<IReadOnlyList<ExchangeTradeMessage>> BootstrapLinearTradesAsync(IReadOnlyList<InstrumentDefinition> instruments, DateTime? catchUpFromUtc, CancellationToken cancellationToken)
-    {
-        var result = new List<ExchangeTradeMessage>();
-
-        foreach (var instrument in instruments.Where(static x => x.Category.Equals("linear", StringComparison.OrdinalIgnoreCase)))
-        {
-            var trades = await apiClient.GetRecentLinearTradesAsync(instrument.Symbol, cancellationToken);
-            foreach (var trade in trades)
-            {
-                if (catchUpFromUtc is not null && trade.Timestamp <= catchUpFromUtc.Value)
-                {
-                    continue;
-                }
-
-                result.Add(new ExchangeTradeMessage(instrument, MapTrade(trade)));
-            }
-        }
-
-        return result;
-    }
-
-    private async Task<IReadOnlyList<ExchangeTradeMessage>> BootstrapOptionTradesAsync(IReadOnlyList<InstrumentDefinition> instruments, DateTime? catchUpFromUtc, CancellationToken cancellationToken)
-    {
-        var trackedSymbols = instruments
-            .Where(static x => x.Category.Equals("option", StringComparison.OrdinalIgnoreCase))
-            .ToDictionary(static x => x.Symbol, StringComparer.OrdinalIgnoreCase);
-        var result = new List<ExchangeTradeMessage>();
-
-        var trades = await apiClient.GetRecentOptionTradesAsync(_options.BaseAsset, cancellationToken);
-        foreach (var trade in trades)
-        {
-            if (catchUpFromUtc is not null && trade.Timestamp <= catchUpFromUtc.Value)
-            {
-                continue;
-            }
-
-            if (trackedSymbols.TryGetValue(trade.Symbol, out var instrument))
-            {
-                result.Add(new ExchangeTradeMessage(instrument, MapTrade(trade)));
-            }
-        }
-
-        return result;
     }
 
     private async Task<UpdateSubscription> SubscribeAsync(Task<CryptoExchange.Net.Objects.CallResult<UpdateSubscription>> task)

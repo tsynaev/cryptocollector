@@ -64,6 +64,12 @@ public sealed class DeribitApiClient(
     public Task<IReadOnlyList<DeribitTrade>> GetFutureTradesAsync(string baseAsset, DateTime fromUtc, DateTime toUtc, CancellationToken cancellationToken) =>
         GetTradesByTimeRangeAsync(baseAsset, "future", fromUtc, toUtc, cancellationToken);
 
+    public IAsyncEnumerable<DeribitTrade> StreamOptionTradesAsync(string baseAsset, DateTime fromUtc, DateTime toUtc, CancellationToken cancellationToken) =>
+        StreamTradesByTimeRangeAsync(baseAsset, "option", fromUtc, toUtc, cancellationToken);
+
+    public IAsyncEnumerable<DeribitTrade> StreamFutureTradesAsync(string baseAsset, DateTime fromUtc, DateTime toUtc, CancellationToken cancellationToken) =>
+        StreamTradesByTimeRangeAsync(baseAsset, "future", fromUtc, toUtc, cancellationToken);
+
     private async Task<IReadOnlyList<DeribitInstrument>> GetInstrumentsAsync(string currency, string kind, CancellationToken cancellationToken)
     {
         var response = await ExecuteWithRetryAsync(
@@ -168,6 +174,59 @@ public sealed class DeribitApiClient(
         }
 
         return result;
+    }
+
+    private async IAsyncEnumerable<DeribitTrade> StreamTradesByTimeRangeAsync(
+        string currency,
+        string kind,
+        DateTime fromUtc,
+        DateTime toUtc,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        if (toUtc <= fromUtc)
+        {
+            yield break;
+        }
+
+        var startTimestamp = new DateTimeOffset(DateTime.SpecifyKind(fromUtc, DateTimeKind.Utc)).ToUnixTimeMilliseconds();
+        var endTimestamp = new DateTimeOffset(DateTime.SpecifyKind(toUtc, DateTimeKind.Utc)).ToUnixTimeMilliseconds();
+
+        while (startTimestamp <= endTimestamp)
+        {
+            var page = await ExecuteWithRetryAsync(
+                ct => GetAsync<DeribitTradeBatch>(
+                    "public/get_last_trades_by_currency_and_time",
+                    new Dictionary<string, object?>
+                    {
+                        ["currency"] = currency,
+                        ["kind"] = kind,
+                        ["start_timestamp"] = startTimestamp,
+                        ["end_timestamp"] = endTimestamp,
+                        ["count"] = _options.RestTradeBootstrapCount,
+                        ["sorting"] = "asc"
+                    },
+                    ct),
+                $"public/get_last_trades_by_currency_and_time({kind})",
+                cancellationToken);
+
+            if (page.Trades.Count == 0)
+            {
+                yield break;
+            }
+
+            foreach (var trade in page.Trades)
+            {
+                yield return trade;
+            }
+
+            var newestTimestamp = page.Trades.Max(static x => x.Timestamp);
+            if (!page.HasMore || newestTimestamp >= endTimestamp)
+            {
+                yield break;
+            }
+
+            startTimestamp = newestTimestamp + 1;
+        }
     }
 
     private async Task<T> GetAsync<T>(string method, Dictionary<string, object?> parameters, CancellationToken cancellationToken)

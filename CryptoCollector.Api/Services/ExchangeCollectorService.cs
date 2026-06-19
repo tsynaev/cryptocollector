@@ -15,6 +15,8 @@ public sealed class ExchangeCollectorService(
     BlockTradeAlertService blockTradeAlertService,
     ILogger<ExchangeCollectorService> logger) : BackgroundService
 {
+    private const int BootstrapTradeFlushBatchSize = 5_000;
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         IReadOnlyList<InstrumentDefinition> instruments = [];
@@ -45,20 +47,21 @@ public sealed class ExchangeCollectorService(
 
                 try
                 {
-                    var latestTradeTimestampUtc = await store.GetLatestTimestampAsync<TradeRecord>(exchange.Name, DataSetNames.Trades, stoppingToken);
-                    var catchUpFromUtc = latestTradeTimestampUtc?.Date;
+                    var catchUpFromUtc = await store.GetLatestTimestampAsync<TradeRecord>(
+                        exchange.Name,
+                        DataSetNames.Trades,
+                        stoppingToken);
 
                     if (catchUpFromUtc is not null)
                     {
                         logger.LogInformation(
-                            "{Exchange} bootstrap catch-up starts from {CatchUpDateUtc:yyyy-MM-dd} based on latest persisted trade at {LatestTradeUtc:O}.",
+                            "{Exchange} bootstrap catch-up starts from {CatchUpUtc:O}.",
                             exchange.Name,
-                            catchUpFromUtc.Value,
-                            latestTradeTimestampUtc!.Value);
+                            catchUpFromUtc.Value);
                     }
 
-                    var bootstrap = await exchange.BootstrapAsync(instruments, catchUpFromUtc, stoppingToken);
-                    FlushBootstrap(bootstrap);
+                    await FlushCatchUpTradesAsync(instruments, catchUpFromUtc, stoppingToken);
+                    await FlushTickerSnapshotAsync(instruments, stoppingToken);
                     await flushableMarketDataSink.FlushPendingAsync(stoppingToken);
                 }
                 catch (Exception exception)
@@ -68,8 +71,7 @@ public sealed class ExchangeCollectorService(
 
                 try
                 {
-                    var options = await exchange.PollOptionChainSnapshotsAsync(instruments, stoppingToken);
-                    FlushOptions(options);
+                    await FlushOptionChainSnapshotAsync(instruments, stoppingToken);
                     await flushableMarketDataSink.FlushPendingAsync(stoppingToken);
                 }
                 catch (Exception exception)
@@ -137,8 +139,7 @@ public sealed class ExchangeCollectorService(
         {
             try
             {
-                var options = await exchange.PollOptionChainSnapshotsAsync(instruments, cancellationToken);
-                FlushOptions(options);
+                await FlushOptionChainSnapshotAsync(instruments, cancellationToken);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -148,33 +149,6 @@ public sealed class ExchangeCollectorService(
             {
                 logger.LogWarning(exception, "{Exchange} option-chain snapshot poll failed.", exchange.Name);
             }
-        }
-    }
-
-    private void FlushBootstrap(ExchangeBootstrapBatch bootstrap)
-    {
-        foreach (var trade in bootstrap.Trades
-                     .OrderBy(static x => x.Trade.TradeTime)
-                     .ThenBy(static x => x.Instrument.Symbol, StringComparer.OrdinalIgnoreCase)
-                     .ThenBy(static x => x.Trade.TradeId, StringComparer.Ordinal))
-        {
-            marketDataSink.IngestTrade(trade.Instrument, trade.Trade);
-            blockTradeAlertService.IngestRecoveredTrade(trade.Instrument, trade.Trade);
-        }
-
-        foreach (var ticker in bootstrap.Tickers)
-        {
-            marketDataSink.IngestTicker(ticker.Instrument, ticker.Ticker);
-        }
-
-        FlushOptions(bootstrap.Options);
-    }
-
-    private void FlushOptions(IReadOnlyList<ExchangeOptionMessage> options)
-    {
-        foreach (var option in options)
-        {
-            marketDataSink.IngestOption(option.Instrument, option.OptionTicker);
         }
     }
 
@@ -194,6 +168,46 @@ public sealed class ExchangeCollectorService(
                 break;
             default:
                 throw new InvalidOperationException($"Unsupported exchange message type: {message.GetType().Name}");
+        }
+    }
+
+    private async Task FlushCatchUpTradesAsync(
+        IReadOnlyList<InstrumentDefinition> instruments,
+        DateTime? catchUpFromUtc,
+        CancellationToken cancellationToken)
+    {
+        var processedCount = 0;
+
+        await foreach (var trade in exchange.StreamTradesSinceAsync(instruments, catchUpFromUtc, cancellationToken))
+        {
+            marketDataSink.IngestTrade(trade.Instrument, trade.Trade);
+            blockTradeAlertService.IngestRecoveredTrade(trade.Instrument, trade.Trade);
+            processedCount++;
+
+            if (processedCount % BootstrapTradeFlushBatchSize == 0)
+            {
+                await flushableMarketDataSink.FlushPendingAsync(cancellationToken);
+            }
+        }
+    }
+
+    private async Task FlushTickerSnapshotAsync(
+        IReadOnlyList<InstrumentDefinition> instruments,
+        CancellationToken cancellationToken)
+    {
+        await foreach (var ticker in exchange.StreamTickersSnapshotAsync(instruments, cancellationToken))
+        {
+            marketDataSink.IngestTicker(ticker.Instrument, ticker.Ticker);
+        }
+    }
+
+    private async Task FlushOptionChainSnapshotAsync(
+        IReadOnlyList<InstrumentDefinition> instruments,
+        CancellationToken cancellationToken)
+    {
+        await foreach (var option in exchange.StreamOptionChainSnapshotAsync(instruments, cancellationToken))
+        {
+            marketDataSink.IngestOption(option.Instrument, option.OptionTicker);
         }
     }
 }

@@ -27,7 +27,10 @@ public sealed class DeribitExchange(
     public Task<IReadOnlyList<InstrumentDefinition>> GetTrackedInstrumentsAsync(CancellationToken cancellationToken) =>
         apiClient.GetTrackedInstrumentsAsync(_options.BaseAsset, _options.QuoteAsset, cancellationToken);
 
-    public async Task<ExchangeBootstrapBatch> BootstrapAsync(IReadOnlyList<InstrumentDefinition> instruments, DateTime? catchUpFromUtc, CancellationToken cancellationToken)
+    public async IAsyncEnumerable<ExchangeTradeMessage> StreamTradesSinceAsync(
+        IReadOnlyList<InstrumentDefinition> instruments,
+        DateTime? catchUpFromUtc,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         var bootstrapFromUtc = catchUpFromUtc ?? DateTime.UtcNow.AddHours(-24);
         var bootstrapToUtc = DateTime.UtcNow;
@@ -37,70 +40,74 @@ public sealed class DeribitExchange(
         var futureSymbols = instruments
             .Where(static x => x.Category.Equals("future", StringComparison.OrdinalIgnoreCase) || x.Category.Equals("perpetual", StringComparison.OrdinalIgnoreCase))
             .ToDictionary(static x => x.Symbol, StringComparer.OrdinalIgnoreCase);
-        var tickers = new List<ExchangeTickerMessage>();
-        var trades = new List<ExchangeTradeMessage>();
 
+        await foreach (var trade in apiClient.StreamOptionTradesAsync(_options.BaseAsset, bootstrapFromUtc, bootstrapToUtc, cancellationToken))
+        {
+            if (!optionSymbols.TryGetValue(trade.InstrumentName, out var instrument))
+            {
+                continue;
+            }
+
+            if (catchUpFromUtc is not null &&
+                DateTimeOffset.FromUnixTimeMilliseconds(trade.Timestamp).UtcDateTime <= catchUpFromUtc.Value)
+            {
+                continue;
+            }
+
+            yield return new ExchangeTradeMessage(instrument, MapTrade(trade));
+        }
+
+        await foreach (var trade in apiClient.StreamFutureTradesAsync(_options.BaseAsset, bootstrapFromUtc, bootstrapToUtc, cancellationToken))
+        {
+            if (!futureSymbols.TryGetValue(trade.InstrumentName, out var instrument))
+            {
+                continue;
+            }
+
+            if (catchUpFromUtc is not null &&
+                DateTimeOffset.FromUnixTimeMilliseconds(trade.Timestamp).UtcDateTime <= catchUpFromUtc.Value)
+            {
+                continue;
+            }
+
+            yield return new ExchangeTradeMessage(instrument, MapTrade(trade));
+        }
+    }
+
+    public async IAsyncEnumerable<ExchangeTickerMessage> StreamTickersSnapshotAsync(
+        IReadOnlyList<InstrumentDefinition> instruments,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        var futureSymbols = instruments
+            .Where(static x => x.Category.Equals("future", StringComparison.OrdinalIgnoreCase) || x.Category.Equals("perpetual", StringComparison.OrdinalIgnoreCase))
+            .ToDictionary(static x => x.Symbol, StringComparer.OrdinalIgnoreCase);
         var futureSummaries = await apiClient.GetFutureSummariesAsync(_options.BaseAsset, cancellationToken);
+        var timestamp = DateTimeOffset.UtcNow;
+
         foreach (var summary in futureSummaries)
         {
             if (futureSymbols.TryGetValue(summary.InstrumentName, out var instrument))
             {
-                tickers.Add(new ExchangeTickerMessage(instrument, DeribitApiClient.MapFutureTicker(summary, DateTimeOffset.UtcNow)));
+                yield return new ExchangeTickerMessage(instrument, DeribitApiClient.MapFutureTicker(summary, timestamp));
             }
         }
-
-        var optionTrades = await apiClient.GetOptionTradesAsync(_options.BaseAsset, bootstrapFromUtc, bootstrapToUtc, cancellationToken);
-        foreach (var trade in optionTrades)
-        {
-            if (DateTimeOffset.FromUnixTimeMilliseconds(trade.Timestamp).UtcDateTime < bootstrapFromUtc)
-            {
-                continue;
-            }
-
-            if (optionSymbols.TryGetValue(trade.InstrumentName, out var instrument))
-            {
-                trades.Add(new ExchangeTradeMessage(instrument, MapTrade(trade)));
-            }
-        }
-
-        var futureTrades = await apiClient.GetFutureTradesAsync(_options.BaseAsset, bootstrapFromUtc, bootstrapToUtc, cancellationToken);
-        foreach (var trade in futureTrades)
-        {
-            if (DateTimeOffset.FromUnixTimeMilliseconds(trade.Timestamp).UtcDateTime < bootstrapFromUtc)
-            {
-                continue;
-            }
-
-            if (futureSymbols.TryGetValue(trade.InstrumentName, out var instrument))
-            {
-                trades.Add(new ExchangeTradeMessage(instrument, MapTrade(trade)));
-            }
-        }
-
-        return new ExchangeBootstrapBatch
-        {
-            Tickers = tickers,
-            Trades = trades
-        };
     }
 
-    public async Task<IReadOnlyList<ExchangeOptionMessage>> PollOptionChainSnapshotsAsync(IReadOnlyList<InstrumentDefinition> instruments, CancellationToken cancellationToken)
+    public async IAsyncEnumerable<ExchangeOptionMessage> StreamOptionChainSnapshotAsync(
+        IReadOnlyList<InstrumentDefinition> instruments,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         var optionSymbols = instruments
             .Where(static x => x.Category.Equals("option", StringComparison.OrdinalIgnoreCase))
             .ToDictionary(static x => x.Symbol, StringComparer.OrdinalIgnoreCase);
-        var result = new List<ExchangeOptionMessage>();
-
         var snapshots = await apiClient.GetOptionChainSnapshotsAsync(cancellationToken);
         foreach (var snapshot in snapshots)
         {
             if (optionSymbols.TryGetValue(snapshot.Symbol, out var instrument))
             {
-                result.Add(new ExchangeOptionMessage(instrument, snapshot.Ticker));
+                yield return new ExchangeOptionMessage(instrument, snapshot.Ticker);
             }
         }
-
-        return result;
     }
 
     public async IAsyncEnumerable<ExchangeDataMessage> StreamAsync(
