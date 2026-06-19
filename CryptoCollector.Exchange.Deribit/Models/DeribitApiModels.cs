@@ -136,14 +136,38 @@ public sealed class DeribitTrade
     [JsonPropertyName("price")]
     public decimal Price { get; init; }
 
+    [JsonPropertyName("mark_price")]
+    public decimal? MarkPrice { get; init; }
+
+    [JsonPropertyName("index_price")]
+    public decimal? IndexPrice { get; init; }
+
+    [JsonPropertyName("iv")]
+    public decimal? Iv { get; init; }
+
     [JsonPropertyName("amount")]
     public decimal Amount { get; init; }
 
     [JsonPropertyName("contracts")]
     public decimal? Contracts { get; init; }
 
+    [JsonPropertyName("tick_direction")]
+    public int? TickDirection { get; init; }
+
     [JsonPropertyName("block_trade_id")]
     public string? BlockTradeId { get; init; }
+
+    [JsonPropertyName("block_trade_leg_count")]
+    public int? BlockTradeLegCount { get; init; }
+
+    [JsonPropertyName("combo_id")]
+    public string? ComboId { get; init; }
+
+    [JsonPropertyName("combo_trade_id")]
+    public string? ComboTradeId { get; init; }
+
+    [JsonPropertyName("block_rfq_id")]
+    public long? BlockRfqId { get; init; }
 
     [JsonPropertyName("liquidation")]
     public string? Liquidation { get; init; }

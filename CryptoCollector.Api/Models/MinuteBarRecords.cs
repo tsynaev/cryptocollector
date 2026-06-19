@@ -23,6 +23,41 @@ public sealed class TradeRecord : ITimeSeriesRecord
     public string? OptionSide { get; set; }
     public string TradeId { get; set; } = string.Empty;
     public string Side { get; set; } = string.Empty;
+    public decimal? Contracts { get; set; }
+    public decimal? Amount { get; set; }
+    public decimal Price { get; set; }
+    public decimal? MarkPrice { get; set; }
+    public decimal? IndexPrice { get; set; }
+    public decimal? Iv { get; set; }
+    public decimal? MarkIv { get; set; }
+    public string? TickDirection { get; set; }
+    public decimal Quantity { get; set; }
+    public decimal Notional { get; set; }
+    public bool IsBlockTrade { get; set; }
+    public string? BlockTradeId { get; set; }
+    public int? BlockTradeLegCount { get; set; }
+    public string? ComboId { get; set; }
+    public string? ComboTradeId { get; set; }
+    public string? BlockRfqId { get; set; }
+    public string? Liquidation { get; set; }
+    public bool IsRpiTrade { get; set; }
+    public string? Sequence { get; set; }
+}
+
+public sealed class LegacyTradeRecordV2 : ITimeSeriesRecord
+{
+    public string Exchange { get; set; } = string.Empty;
+    public string Symbol { get; set; } = string.Empty;
+    public string MarketType { get; set; } = string.Empty;
+    public string BaseAsset { get; set; } = string.Empty;
+    public string QuoteAsset { get; set; } = string.Empty;
+    public string SettleAsset { get; set; } = string.Empty;
+    public DateTime Date { get; set; }
+    public DateTime? ExpiryUtc { get; set; }
+    public decimal? StrikePrice { get; set; }
+    public string? OptionSide { get; set; }
+    public string TradeId { get; set; } = string.Empty;
+    public string Side { get; set; } = string.Empty;
     public decimal Price { get; set; }
     public decimal Quantity { get; set; }
     public decimal Notional { get; set; }
@@ -30,6 +65,30 @@ public sealed class TradeRecord : ITimeSeriesRecord
     public string? BlockTradeId { get; set; }
     public bool IsRpiTrade { get; set; }
     public string? Sequence { get; set; }
+
+    public TradeRecord Upgrade() =>
+        new()
+        {
+            Exchange = Exchange,
+            Symbol = Symbol,
+            MarketType = MarketType,
+            BaseAsset = BaseAsset,
+            QuoteAsset = QuoteAsset,
+            SettleAsset = SettleAsset,
+            Date = Date,
+            ExpiryUtc = ExpiryUtc,
+            StrikePrice = StrikePrice,
+            OptionSide = OptionSide,
+            TradeId = TradeId,
+            Side = Side,
+            Price = Price,
+            Quantity = Quantity,
+            Notional = Notional,
+            IsBlockTrade = IsBlockTrade,
+            BlockTradeId = BlockTradeId,
+            IsRpiTrade = IsRpiTrade,
+            Sequence = Sequence
+        };
 }
 
 public sealed class LegacyTradeRecordV1 : ITimeSeriesRecord

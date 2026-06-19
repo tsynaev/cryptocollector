@@ -187,13 +187,8 @@ public sealed class DailyParquetStore(IOptions<StorageOptions> options)
         }
         catch (ParquetException) when (typeof(T) == typeof(TradeRecord))
         {
-            var legacyRows = await ParquetSerializer.DeserializeAsync<LegacyTradeRecordV1>(
-                filePath,
-                _parquetOptions,
-                cancellationToken: cancellationToken);
-
-            return legacyRows.Data
-                .Select(static x => (T)(ITimeSeriesRecord)x.Upgrade())
+            return (await ReadLegacyTradeRowsAsync(filePath, cancellationToken))
+                .Select(static x => (T)(ITimeSeriesRecord)x)
                 .ToArray();
         }
     }
@@ -206,13 +201,7 @@ public sealed class DailyParquetStore(IOptions<StorageOptions> options)
             throw new ParquetException($"Schema migration is not implemented for {typeof(T).Name}.");
         }
 
-        var legacyRows = await ParquetSerializer.DeserializeAsync<LegacyTradeRecordV1>(
-            filePath,
-            _parquetOptions,
-            cancellationToken: cancellationToken);
-
-        var mergedRows = legacyRows.Data
-            .Select(static x => x.Upgrade())
+        var mergedRows = (await ReadLegacyTradeRowsAsync(filePath, cancellationToken))
             .Concat(newRows.Cast<TradeRecord>())
             .OrderBy(static x => x.Date)
             .ThenBy(static x => x.Symbol, StringComparer.OrdinalIgnoreCase)
@@ -227,5 +216,31 @@ public sealed class DailyParquetStore(IOptions<StorageOptions> options)
                 Append = false
             },
             cancellationToken: cancellationToken);
+    }
+
+    private async Task<IReadOnlyList<TradeRecord>> ReadLegacyTradeRowsAsync(string filePath, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var legacyRowsV2 = await ParquetSerializer.DeserializeAsync<LegacyTradeRecordV2>(
+                filePath,
+                _parquetOptions,
+                cancellationToken: cancellationToken);
+
+            return legacyRowsV2.Data
+                .Select(static x => x.Upgrade())
+                .ToArray();
+        }
+        catch (ParquetException)
+        {
+            var legacyRowsV1 = await ParquetSerializer.DeserializeAsync<LegacyTradeRecordV1>(
+                filePath,
+                _parquetOptions,
+                cancellationToken: cancellationToken);
+
+            return legacyRowsV1.Data
+                .Select(static x => x.Upgrade())
+                .ToArray();
+        }
     }
 }
