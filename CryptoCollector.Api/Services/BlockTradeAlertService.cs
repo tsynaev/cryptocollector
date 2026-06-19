@@ -412,7 +412,7 @@ public sealed class BlockTradeAlertService(
             .ThenBy(static x => x.Symbol, StringComparer.OrdinalIgnoreCase)
             .ToArray();
         var timestamp = orderedLegs[0].TimestampUtc;
-        var legLines = await FormatLegLinesAsync(orderedLegs, cancellationToken);
+        var legTable = await FormatLegTableAsync(orderedLegs, cancellationToken);
         var baseAsset = orderedLegs
             .Select(static x => x.BaseAsset)
             .FirstOrDefault(static x => !string.IsNullOrWhiteSpace(x));
@@ -425,16 +425,16 @@ public sealed class BlockTradeAlertService(
             $"<b>BLOCK TRADE {encoder.Encode(group.Exchange.ToUpperInvariant())}{headerSuffix}</b>",
             $"{timestamp:dd MMMM yyyy HH:mm:ss} UTC",
             string.Empty,
-            .. legLines,
+            legTable,
             $"<code>{encoder.Encode(group.GroupId)}</code>"
         ]);
     }
 
-    private async Task<IReadOnlyList<string>> FormatLegLinesAsync(
+    private async Task<string> FormatLegTableAsync(
         IReadOnlyList<BlockTradeLeg> orderedLegs,
         CancellationToken cancellationToken)
     {
-        var lines = new List<string>(orderedLegs.Count * 2);
+        var sections = new List<string>();
         var optionGroups = orderedLegs
             .Where(static x => x.MarketType.Equals("option", StringComparison.OrdinalIgnoreCase))
             .GroupBy(static x => x.ExpiryUtc)
@@ -446,67 +446,120 @@ public sealed class BlockTradeAlertService(
 
         foreach (var optionGroup in optionGroups)
         {
-            if (lines.Count > 0)
-            {
-                lines.Add(string.Empty);
-            }
-
             var expiry = optionGroup.Key?.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) ?? "-";
-            lines.Add($"Exp. {expiry}");
+            var rows = new List<FormattedLegRow>();
 
             foreach (var leg in optionGroup
                          .OrderBy(static x => x.TimestampUtc)
                          .ThenBy(static x => x.StrikePrice ?? decimal.MaxValue)
                          .ThenBy(static x => x.OptionSide, StringComparer.OrdinalIgnoreCase))
             {
-                lines.Add(await FormatLegAsync(leg, cancellationToken));
+                rows.Add(await FormatLegRowAsync(leg, cancellationToken));
             }
+
+            sections.Add($"Exp. {expiry}\n{BuildPreTable(rows)}");
         }
 
-        if (nonOptionLegs.Length > 0 && lines.Count > 0)
+        if (nonOptionLegs.Length > 0)
         {
-            lines.Add(string.Empty);
+            var rows = new List<FormattedLegRow>(nonOptionLegs.Length);
+            foreach (var leg in nonOptionLegs)
+            {
+                rows.Add(await FormatLegRowAsync(leg, cancellationToken));
+            }
+
+            sections.Add(BuildPreTable(rows));
         }
 
-        foreach (var leg in nonOptionLegs)
-        {
-            lines.Add(await FormatLegAsync(leg, cancellationToken));
-        }
-
-        return lines;
+        return string.Join("\n\n", sections);
     }
 
-    private async Task<string> FormatLegAsync(BlockTradeLeg leg, CancellationToken cancellationToken)
+    private async Task<FormattedLegRow> FormatLegRowAsync(BlockTradeLeg leg, CancellationToken cancellationToken)
     {
         var side = CultureInfo.InvariantCulture.TextInfo.ToTitleCase(leg.Side.ToLowerInvariant());
-        var optionSide = string.IsNullOrWhiteSpace(leg.OptionSide)
-            ? string.Empty
-            : leg.OptionSide!.ToUpperInvariant();
-        var quantity = leg.Quantity.ToString("0.####", CultureInfo.InvariantCulture);
-        var price = leg.Price.ToString("0.0000", CultureInfo.InvariantCulture);
-        var premium = leg.Notional.ToString("0.0000", CultureInfo.InvariantCulture);
+        var quantity = ResolveDisplayQuantity(leg).ToString("0.####", CultureInfo.InvariantCulture);
 
         if (leg.MarketType.Equals("option", StringComparison.OrdinalIgnoreCase))
         {
             var strike = leg.StrikePrice?.ToString(CultureInfo.InvariantCulture) ?? "-";
+            var optionSide = string.IsNullOrWhiteSpace(leg.OptionSide)
+                ? string.Empty
+                : leg.OptionSide!.ToUpperInvariant();
             if (await TryConvertOptionAmountsAsync(leg, cancellationToken) is { } converted)
             {
-                return $"{side} {quantity} {optionSide} {strike} @ {converted.UnitPriceText} ({converted.TotalPremiumValueText})";
+                return new FormattedLegRow(
+                    side,
+                    quantity,
+                    optionSide,
+                    strike,
+                    converted.UnitPriceText,
+                    converted.TotalPremiumValueText);
             }
 
             var settleAsset = leg.SettleAsset;
-            return $"{side} {quantity} {optionSide} {strike} @ {price} {settleAsset} ({premium} {settleAsset})";
+            return new FormattedLegRow(
+                side,
+                quantity,
+                optionSide,
+                strike,
+                $"{leg.Price.ToString("0.0000", CultureInfo.InvariantCulture)} {settleAsset}",
+                $"{leg.Notional.ToString("0.0000", CultureInfo.InvariantCulture)} {settleAsset}");
         }
 
-        var displayQuantityValue = ResolveDisplayQuantity(leg);
-        if (displayQuantityValue != leg.Quantity)
-        {
-            var displayQuantity = displayQuantityValue.ToString("0.####", CultureInfo.InvariantCulture);
-            return $"{side} {displayQuantity} {leg.Symbol} @ {price}";
-        }
-
-        return $"{side} {quantity} {leg.Symbol} @ {price}";
+        return new FormattedLegRow(
+            side,
+            quantity,
+            string.Empty,
+            string.Empty,
+            leg.Price.ToString("0.0000", CultureInfo.InvariantCulture),
+            string.Empty);
     }
+
+    private static string BuildPreTable(IReadOnlyList<FormattedLegRow> rows)
+    {
+        if (rows.Count == 0)
+        {
+            return "<pre>-</pre>";
+        }
+
+        var sideWidth = Math.Max(4, rows.Max(static x => x.Side.Length));
+        var quantityWidth = Math.Max(3, rows.Max(static x => x.Quantity.Length));
+        var typeWidth = Math.Max(4, rows.Max(static x => x.Type.Length));
+        var strikeWidth = Math.Max(6, rows.Max(static x => x.Strike.Length));
+        var priceWidth = Math.Max(5, rows.Max(static x => x.Price.Length));
+        var premiumWidth = Math.Max(7, rows.Max(static x => x.Premium.Length));
+        var lines = new List<string>(rows.Count + 1)
+        {
+            string.Join("  ",
+            [
+                PadRight("Side", sideWidth),
+                PadLeft("Qty", quantityWidth),
+                PadRight("Type", typeWidth),
+                PadLeft("Strike", strikeWidth),
+                PadLeft("Price", priceWidth),
+                PadLeft("Premium", premiumWidth)
+            ])
+        };
+
+        foreach (var row in rows)
+        {
+            lines.Add(string.Join("  ",
+            [
+                PadRight(row.Side, sideWidth),
+                PadLeft(row.Quantity, quantityWidth),
+                PadRight(row.Type, typeWidth),
+                PadLeft(row.Strike, strikeWidth),
+                PadLeft(row.Price, priceWidth),
+                PadLeft(row.Premium, premiumWidth)
+            ]));
+        }
+
+        return $"<pre>{string.Join('\n', lines)}</pre>";
+    }
+
+    private static string PadLeft(string value, int width) => value.PadLeft(width, ' ');
+
+    private static string PadRight(string value, int width) => value.PadRight(width, ' ');
 
     private async Task<PositionPnlChart?> BuildPositionPnlChartAsync(
         BlockTradeGroup group,
@@ -1140,6 +1193,14 @@ public sealed class BlockTradeAlertService(
         decimal PremiumUsd,
         decimal Volatility,
         decimal TimeToExpiryYears);
+
+    private sealed record FormattedLegRow(
+        string Side,
+        string Quantity,
+        string Type,
+        string Strike,
+        string Price,
+        string Premium);
 
     private sealed record ConvertedOptionAmounts(string UnitPriceText, string TotalPremiumValueText, string TotalPremiumText);
     private sealed record PendingTrade(InstrumentDefinition Instrument, ExchangeTrade Trade, bool UpdateCursor);
