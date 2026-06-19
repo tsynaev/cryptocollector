@@ -3,12 +3,14 @@ using CryptoCollector.Api.Options;
 using Microsoft.Extensions.Options;
 using Parquet;
 using Parquet.Serialization;
+using System.Collections.Concurrent;
 
 namespace CryptoCollector.Api.Services;
 
 public sealed class DailyParquetStore(IOptions<StorageOptions> options)
 {
     private readonly string _dataRoot = Path.GetFullPath(options.Value.DataRoot);
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _fileLocks = new(StringComparer.OrdinalIgnoreCase);
     private readonly ParquetOptions _parquetOptions = new()
     {
         CompressionMethod = CompressionMethod.Zstd
@@ -33,26 +35,29 @@ public sealed class DailyParquetStore(IOptions<StorageOptions> options)
             Directory.CreateDirectory(directory);
 
             var filePath = Path.Combine(directory, $"{group.Key:yyyy-MM-dd}.parquet");
-            var writeOptions = new ParquetOptions
-            {
-                CompressionMethod = _parquetOptions.CompressionMethod,
-                Append = File.Exists(filePath)
-            };
-
             var orderedRows = group.OrderBy(static x => x.Date).ThenBy(static x => x.Symbol, StringComparer.OrdinalIgnoreCase).ToArray();
 
-            try
+            await WithFileLockAsync(filePath, async () =>
             {
-                await ParquetSerializer.SerializeAsync(
-                    orderedRows,
-                    filePath,
-                    writeOptions,
-                    cancellationToken: cancellationToken);
-            }
-            catch (ParquetException) when (File.Exists(filePath))
-            {
-                await MigrateAndRewriteAsync(filePath, orderedRows, cancellationToken);
-            }
+                var writeOptions = new ParquetOptions
+                {
+                    CompressionMethod = _parquetOptions.CompressionMethod,
+                    Append = File.Exists(filePath)
+                };
+
+                try
+                {
+                    await ParquetSerializer.SerializeAsync(
+                        orderedRows,
+                        filePath,
+                        writeOptions,
+                        cancellationToken: cancellationToken);
+                }
+                catch (ParquetException) when (File.Exists(filePath))
+                {
+                    await MigrateAndRewriteAsync(filePath, orderedRows, cancellationToken);
+                }
+            }, cancellationToken);
         }
     }
 
@@ -79,7 +84,10 @@ public sealed class DailyParquetStore(IOptions<StorageOptions> options)
             var filePath = Path.Combine(directory, $"{current:yyyy-MM-dd}.parquet");
             if (File.Exists(filePath))
             {
-                foreach (var row in await ReadRowsAsync<T>(filePath, cancellationToken))
+                foreach (var row in await WithFileLockAsync(
+                             filePath,
+                             () => ReadRowsAsync<T>(filePath, cancellationToken),
+                             cancellationToken))
                 {
                     if (row.Date < fromUtc || row.Date > toUtc)
                     {
@@ -126,7 +134,10 @@ public sealed class DailyParquetStore(IOptions<StorageOptions> options)
 
         foreach (var filePath in files)
         {
-            foreach (var row in await ReadRowsAsync<T>(filePath, cancellationToken))
+            foreach (var row in await WithFileLockAsync(
+                         filePath,
+                         () => ReadRowsAsync<T>(filePath, cancellationToken),
+                         cancellationToken))
             {
                 if (!string.IsNullOrWhiteSpace(symbol) && !row.Symbol.Equals(symbol, StringComparison.OrdinalIgnoreCase))
                 {
@@ -241,6 +252,36 @@ public sealed class DailyParquetStore(IOptions<StorageOptions> options)
             return legacyRowsV1.Data
                 .Select(static x => x.Upgrade())
                 .ToArray();
+        }
+    }
+
+    private async Task WithFileLockAsync(string filePath, Func<Task> action, CancellationToken cancellationToken)
+    {
+        var gate = _fileLocks.GetOrAdd(filePath, static _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(cancellationToken);
+
+        try
+        {
+            await action();
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    private async Task<T> WithFileLockAsync<T>(string filePath, Func<Task<T>> action, CancellationToken cancellationToken)
+    {
+        var gate = _fileLocks.GetOrAdd(filePath, static _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(cancellationToken);
+
+        try
+        {
+            return await action();
+        }
+        finally
+        {
+            gate.Release();
         }
     }
 }
