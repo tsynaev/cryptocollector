@@ -23,9 +23,11 @@ public sealed class BlockTradeAlertService(
 
     private readonly BlockTradesAlertOptions _options = options.Value;
     private readonly ConcurrentDictionary<string, BlockTradeGroup> _groups = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentQueue<PendingTrade> _pendingTrades = new();
     private readonly Lock _stateGate = new();
     private BlockTradeAlertState _state = new();
     private volatile bool _stateDirty;
+    private volatile bool _startupReplayCompleted;
     private DateTime _lastStatePersistedUtc = DateTime.MinValue;
 
     public void IngestRecoveredTrade(InstrumentDefinition instrument, ExchangeTrade trade)
@@ -45,12 +47,14 @@ public sealed class BlockTradeAlertService(
 
         await InitializeStateAsync(exchangesToReplay, stoppingToken);
         await ReplayStoredBlockTradesAsync(exchangesToReplay, stoppingToken);
+        DrainPendingTrades();
+        _startupReplayCompleted = true;
 
         using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(500));
 
         while (!stoppingToken.IsCancellationRequested && await timer.WaitForNextTickAsync(stoppingToken))
         {
-            FlushReadyGroups();
+            await FlushReadyGroupsAsync(stoppingToken);
             if (ShouldPersistState())
             {
                 await PersistStateAsync(stoppingToken);
@@ -60,7 +64,7 @@ public sealed class BlockTradeAlertService(
 
     public override async Task StopAsync(CancellationToken cancellationToken)
     {
-        FlushReadyGroups(force: true);
+        await FlushReadyGroupsAsync(cancellationToken, force: true);
         await PersistStateAsync(cancellationToken, force: true);
         await base.StopAsync(cancellationToken);
     }
@@ -74,12 +78,7 @@ public sealed class BlockTradeAlertService(
                 continue;
             }
 
-            var latestTradeTimestampUtc = await store.GetLatestTimestampAsync<TradeRecord>(
-                exchange,
-                DataSetNames.Trades,
-                cancellationToken);
-
-            var replayFromUtc = latestTradeTimestampUtc?.AddHours(-24) ?? DateTime.UtcNow.AddHours(-24);
+            var replayFromUtc = DateTime.UtcNow.AddHours(-24);
 
             _state.Exchanges[exchange] = new AlertCursor
             {
@@ -132,7 +131,7 @@ public sealed class BlockTradeAlertService(
             }
         }
 
-        FlushReadyGroups(force: true);
+        await FlushReadyGroupsAsync(cancellationToken, force: true);
         if (_stateDirty)
         {
             await PersistStateAsync(cancellationToken, force: true);
@@ -140,6 +139,17 @@ public sealed class BlockTradeAlertService(
     }
 
     private void IngestInternal(InstrumentDefinition instrument, ExchangeTrade trade, bool updateCursor)
+    {
+        if (!_startupReplayCompleted)
+        {
+            _pendingTrades.Enqueue(new PendingTrade(instrument, trade, updateCursor));
+            return;
+        }
+
+        IngestCore(instrument, trade, updateCursor);
+    }
+
+    private void IngestCore(InstrumentDefinition instrument, ExchangeTrade trade, bool updateCursor)
     {
         var timestamp = trade.TradeTime.UtcDateTime;
         var tradeKey = BuildTradeKey(instrument.Exchange, instrument.Symbol, trade.TradeId, timestamp);
@@ -161,6 +171,9 @@ public sealed class BlockTradeAlertService(
             instrument.Exchange,
             instrument.Symbol,
             instrument.MarketType,
+            instrument.BaseAsset,
+            instrument.QuoteAsset,
+            instrument.SettleAsset,
             instrument.ExpiryUtc,
             instrument.StrikePrice,
             instrument.OptionSide,
@@ -181,6 +194,28 @@ public sealed class BlockTradeAlertService(
             });
     }
 
+    private void DrainPendingTrades()
+    {
+        if (_pendingTrades.IsEmpty)
+        {
+            return;
+        }
+
+        var bufferedTrades = new List<PendingTrade>();
+        while (_pendingTrades.TryDequeue(out var pendingTrade))
+        {
+            bufferedTrades.Add(pendingTrade);
+        }
+
+        foreach (var pendingTrade in bufferedTrades
+                     .OrderBy(static x => x.Trade.TradeTime.UtcDateTime)
+                     .ThenBy(static x => x.Instrument.Symbol, StringComparer.OrdinalIgnoreCase)
+                     .ThenBy(static x => x.Trade.TradeId, StringComparer.Ordinal))
+        {
+            IngestCore(pendingTrade.Instrument, pendingTrade.Trade, pendingTrade.UpdateCursor);
+        }
+    }
+
     private void IngestStoredTrade(TradeRecord trade)
     {
         var tradeKey = BuildTradeKey(trade.Exchange, trade.Symbol, trade.TradeId, trade.Date);
@@ -198,6 +233,9 @@ public sealed class BlockTradeAlertService(
             trade.Exchange,
             trade.Symbol,
             trade.MarketType,
+            trade.BaseAsset,
+            trade.QuoteAsset,
+            trade.SettleAsset,
             trade.ExpiryUtc,
             trade.StrikePrice,
             trade.OptionSide,
@@ -282,7 +320,7 @@ public sealed class BlockTradeAlertService(
         _lastStatePersistedUtc = DateTime.UtcNow;
     }
 
-    private void FlushReadyGroups(bool force = false)
+    private async Task FlushReadyGroupsAsync(CancellationToken cancellationToken, bool force = false)
     {
         var now = DateTime.UtcNow;
 
@@ -303,7 +341,7 @@ public sealed class BlockTradeAlertService(
                 continue;
             }
 
-            var message = FormatBlockTradeMessage(group);
+            var message = await FormatBlockTradeMessageAsync(group, cancellationToken);
             if (messageQueue.TryEnqueue(message))
             {
                 logger.LogInformation(
@@ -316,7 +354,7 @@ public sealed class BlockTradeAlertService(
         }
     }
 
-    private static string FormatBlockTradeMessage(BlockTradeGroup group)
+    private async Task<string> FormatBlockTradeMessageAsync(BlockTradeGroup group, CancellationToken cancellationToken)
     {
         var encoder = HtmlEncoder.Default;
         var orderedLegs = group.Legs
@@ -324,17 +362,65 @@ public sealed class BlockTradeAlertService(
             .ThenBy(static x => x.Symbol, StringComparer.OrdinalIgnoreCase)
             .ToArray();
         var timestamp = orderedLegs[0].TimestampUtc;
+        var legLines = await FormatLegLinesAsync(orderedLegs, cancellationToken);
 
         return string.Join('\n',
         [
             $"<b>BLOCK TRADE {encoder.Encode(group.Exchange.ToUpperInvariant())}</b>",
             $"{timestamp:dd MMMM yyyy HH:mm:ss} UTC",
-            .. orderedLegs.Select(FormatLeg),
+            string.Empty,
+            .. legLines,
             $"<code>{encoder.Encode(group.BlockTradeId)}</code>"
         ]);
     }
 
-    private static string FormatLeg(BlockTradeLeg leg)
+    private async Task<IReadOnlyList<string>> FormatLegLinesAsync(
+        IReadOnlyList<BlockTradeLeg> orderedLegs,
+        CancellationToken cancellationToken)
+    {
+        var lines = new List<string>(orderedLegs.Count * 2);
+        var optionGroups = orderedLegs
+            .Where(static x => x.MarketType.Equals("option", StringComparison.OrdinalIgnoreCase))
+            .GroupBy(static x => x.ExpiryUtc)
+            .OrderBy(static x => x.Key ?? DateTime.MaxValue)
+            .ToArray();
+        var nonOptionLegs = orderedLegs
+            .Where(static x => !x.MarketType.Equals("option", StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+
+        foreach (var optionGroup in optionGroups)
+        {
+            if (lines.Count > 0)
+            {
+                lines.Add(string.Empty);
+            }
+
+            var expiry = optionGroup.Key?.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) ?? "-";
+            lines.Add($"Exp. {expiry}");
+
+            foreach (var leg in optionGroup
+                         .OrderBy(static x => x.TimestampUtc)
+                         .ThenBy(static x => x.StrikePrice ?? decimal.MaxValue)
+                         .ThenBy(static x => x.OptionSide, StringComparer.OrdinalIgnoreCase))
+            {
+                lines.Add(await FormatLegAsync(leg, cancellationToken));
+            }
+        }
+
+        if (nonOptionLegs.Length > 0 && lines.Count > 0)
+        {
+            lines.Add(string.Empty);
+        }
+
+        foreach (var leg in nonOptionLegs)
+        {
+            lines.Add(await FormatLegAsync(leg, cancellationToken));
+        }
+
+        return lines;
+    }
+
+    private async Task<string> FormatLegAsync(BlockTradeLeg leg, CancellationToken cancellationToken)
     {
         var side = CultureInfo.InvariantCulture.TextInfo.ToTitleCase(leg.Side.ToLowerInvariant());
         var optionSide = string.IsNullOrWhiteSpace(leg.OptionSide)
@@ -347,8 +433,13 @@ public sealed class BlockTradeAlertService(
         if (leg.MarketType.Equals("option", StringComparison.OrdinalIgnoreCase))
         {
             var strike = leg.StrikePrice?.ToString(CultureInfo.InvariantCulture) ?? "-";
-            var expiry = leg.ExpiryUtc?.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) ?? "-";
-            return $"{side} {quantity} {optionSide} {strike} Exp. {expiry} @ {premium}";
+            if (await TryConvertOptionAmountsAsync(leg, cancellationToken) is { } converted)
+            {
+                return $"{side} {quantity} {optionSide} {strike} @ {converted.UnitPriceText} ({converted.TotalPremiumText})";
+            }
+
+            var settleAsset = leg.SettleAsset;
+            return $"{side} {quantity} {optionSide} {strike} @ {price} {settleAsset} ({premium} {settleAsset})";
         }
 
         if (leg.Exchange.Equals("deribit", StringComparison.OrdinalIgnoreCase) && leg.Price > 0)
@@ -359,6 +450,121 @@ public sealed class BlockTradeAlertService(
 
         return $"{side} {quantity} {leg.Symbol} @ {price}";
     }
+
+    private async Task<ConvertedOptionAmounts?> TryConvertOptionAmountsAsync(BlockTradeLeg leg, CancellationToken cancellationToken)
+    {
+        if (!leg.MarketType.Equals("option", StringComparison.OrdinalIgnoreCase) ||
+            !IsPriceQuotedInBaseAsset(leg))
+        {
+            return null;
+        }
+
+        var underlyingPrice = await ResolveUnderlyingPriceAsync(leg, cancellationToken);
+        if (underlyingPrice is null || underlyingPrice <= 0)
+        {
+            return null;
+        }
+
+        var displayCurrency = ResolveStableDisplayCurrency(leg);
+        var unitPrice = leg.Price * underlyingPrice.Value;
+        var totalPremium = leg.Notional * underlyingPrice.Value;
+
+        return new ConvertedOptionAmounts(
+            $"{unitPrice.ToString("0.00", CultureInfo.InvariantCulture)} {displayCurrency}",
+            $"{totalPremium.ToString("0.00", CultureInfo.InvariantCulture)} {displayCurrency}");
+    }
+
+    private async Task<decimal?> ResolveUnderlyingPriceAsync(BlockTradeLeg leg, CancellationToken cancellationToken)
+    {
+        return await TryResolveUnderlyingPriceAsync(leg, requireTimestampMatch: true, cancellationToken) ??
+               await TryResolveUnderlyingPriceAsync(leg, requireTimestampMatch: false, cancellationToken);
+    }
+
+    private async Task<decimal?> TryResolveUnderlyingPriceAsync(
+        BlockTradeLeg leg,
+        bool requireTimestampMatch,
+        CancellationToken cancellationToken)
+    {
+        var directOptionSnapshots = await store.QueryLatestAsync<OptionChainMinuteBar>(
+            leg.Exchange,
+            DataSetNames.OptionChain,
+            leg.Symbol,
+            row => MatchesUnderlyingSnapshot(row, leg, requireTimestampMatch),
+            cancellationToken);
+        var directOptionSnapshot = directOptionSnapshots
+            .OrderByDescending(static x => x.Date)
+            .FirstOrDefault();
+
+        var directUnderlyingPrice = directOptionSnapshot?.UnderlyingPrice ?? directOptionSnapshot?.IndexPrice;
+        if (directUnderlyingPrice is not null && directUnderlyingPrice > 0)
+        {
+            return directUnderlyingPrice;
+        }
+
+        var baseAssetOptionSnapshots = await store.QueryLatestAsync<OptionChainMinuteBar>(
+            leg.Exchange,
+            DataSetNames.OptionChain,
+            symbol: null,
+            row => row.BaseAsset.Equals(leg.BaseAsset, StringComparison.OrdinalIgnoreCase) &&
+                   MatchesUnderlyingSnapshot(row, leg, requireTimestampMatch),
+            cancellationToken);
+        var baseAssetOptionSnapshot = baseAssetOptionSnapshots
+            .OrderByDescending(static x => x.Date)
+            .FirstOrDefault();
+
+        var optionUnderlyingPrice = baseAssetOptionSnapshot?.UnderlyingPrice ?? baseAssetOptionSnapshot?.IndexPrice;
+        if (optionUnderlyingPrice is not null && optionUnderlyingPrice > 0)
+        {
+            return optionUnderlyingPrice;
+        }
+
+        var tickerSnapshots = await store.QueryLatestAsync<TickerMinuteBar>(
+            leg.Exchange,
+            DataSetNames.Tickers,
+            symbol: null,
+            row => row.BaseAsset.Equals(leg.BaseAsset, StringComparison.OrdinalIgnoreCase) &&
+                   !row.MarketType.Equals("option", StringComparison.OrdinalIgnoreCase) &&
+                   MatchesUnderlyingSnapshot(row, leg, requireTimestampMatch),
+            cancellationToken);
+        var tickerSnapshot = tickerSnapshots
+            .OrderByDescending(static x => x.Date)
+            .FirstOrDefault();
+
+        return tickerSnapshot?.IndexPrice ?? tickerSnapshot?.MarkPrice ?? tickerSnapshot?.LastPrice;
+    }
+
+    private static string ResolveStableDisplayCurrency(BlockTradeLeg leg)
+    {
+        if (leg.QuoteAsset.Equals("USDT", StringComparison.OrdinalIgnoreCase) ||
+            leg.QuoteAsset.Equals("USDC", StringComparison.OrdinalIgnoreCase) ||
+            leg.QuoteAsset.Equals("USD", StringComparison.OrdinalIgnoreCase))
+        {
+            return leg.QuoteAsset.ToUpperInvariant();
+        }
+
+        if (leg.Symbol.Contains("USDC", StringComparison.OrdinalIgnoreCase))
+        {
+            return "USDC";
+        }
+
+        if (leg.Symbol.Contains("USDT", StringComparison.OrdinalIgnoreCase))
+        {
+            return "USDT";
+        }
+
+        return "USDT";
+    }
+
+    private static bool IsPriceQuotedInBaseAsset(BlockTradeLeg leg) =>
+        leg.SettleAsset.Equals(leg.BaseAsset, StringComparison.OrdinalIgnoreCase);
+
+    private static bool MatchesUnderlyingSnapshot(OptionChainMinuteBar row, BlockTradeLeg leg, bool requireTimestampMatch) =>
+        (!requireTimestampMatch || row.Date <= leg.TimestampUtc) &&
+        ((row.UnderlyingPrice ?? row.IndexPrice) ?? 0m) > 0;
+
+    private static bool MatchesUnderlyingSnapshot(TickerMinuteBar row, BlockTradeLeg leg, bool requireTimestampMatch) =>
+        (!requireTimestampMatch || row.Date <= leg.TimestampUtc) &&
+        ((row.IndexPrice ?? row.MarkPrice ?? row.LastPrice) ?? 0m) > 0;
 
     private static string BuildTradeKey(string exchange, string symbol, string tradeId, DateTime timestampUtc) =>
         $"{exchange}|{symbol}|{tradeId}|{timestampUtc:O}";
@@ -412,6 +618,9 @@ public sealed class BlockTradeAlertService(
         string Exchange,
         string Symbol,
         string MarketType,
+        string BaseAsset,
+        string QuoteAsset,
+        string SettleAsset,
         DateTime? ExpiryUtc,
         decimal? StrikePrice,
         string? OptionSide,
@@ -421,4 +630,7 @@ public sealed class BlockTradeAlertService(
         decimal Notional,
         string BlockTradeId,
         DateTime TimestampUtc);
+
+    private sealed record ConvertedOptionAmounts(string UnitPriceText, string TotalPremiumText);
+    private sealed record PendingTrade(InstrumentDefinition Instrument, ExchangeTrade Trade, bool UpdateCursor);
 }
