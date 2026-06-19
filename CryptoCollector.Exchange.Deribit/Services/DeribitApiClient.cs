@@ -303,10 +303,9 @@ public sealed class DeribitApiClient(
         new()
         {
             Exchange = "deribit",
-            Category = source.Kind,
-            MarketType = source.Kind == "future" && source.SettlementPeriod?.Equals("perpetual", StringComparison.OrdinalIgnoreCase) == true
-                ? "perpetual"
-                : source.Kind,
+            InstrumentType = source.Kind.Equals("option", StringComparison.OrdinalIgnoreCase)
+                ? InstrumentType.Option
+                : ResolveDerivativeInstrumentType(source),
             Symbol = source.InstrumentName,
             BaseAsset = source.BaseCurrency,
             QuoteAsset = source.QuoteCurrency,
@@ -317,6 +316,40 @@ public sealed class DeribitApiClient(
                 ? null
                 : source.OptionType.Equals("call", StringComparison.OrdinalIgnoreCase) ? "Call" : "Put"
         };
+
+    private static InstrumentType ResolveDerivativeInstrumentType(DeribitInstrument source)
+    {
+        if (!source.Kind.Equals("future", StringComparison.OrdinalIgnoreCase))
+        {
+            return InstrumentType.Unknown;
+        }
+
+        var baseAsset = source.BaseCurrency;
+        var quoteAsset = source.QuoteCurrency;
+        var settlementAsset = source.SettlementCurrency ?? source.BaseCurrency;
+        var normalizedInstrumentType = source.InstrumentType?.Trim().ToLowerInvariant();
+        var normalizedFutureType = source.FutureType?.Trim().ToLowerInvariant();
+        var isPerpetual = source.SettlementPeriod?.Equals("perpetual", StringComparison.OrdinalIgnoreCase) == true;
+        var isInverse = normalizedInstrumentType switch
+        {
+            "reversed" => true,
+            "linear" => false,
+            _ => normalizedFutureType switch
+            {
+                "reversed" => true,
+                "linear" => false,
+                _ => settlementAsset.Equals(baseAsset, StringComparison.OrdinalIgnoreCase) &&
+                     !quoteAsset.Equals(baseAsset, StringComparison.OrdinalIgnoreCase)
+            }
+        };
+
+        if (isPerpetual)
+        {
+            return isInverse ? InstrumentType.InversePerpetual : InstrumentType.LinearPerpetual;
+        }
+
+        return isInverse ? InstrumentType.InverseFutures : InstrumentType.LinearFutures;
+    }
 
     private static bool MatchesQuoteAsset(DeribitInstrument source, string quoteAsset)
     {

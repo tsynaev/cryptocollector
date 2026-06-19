@@ -3,8 +3,7 @@ namespace CryptoCollector.API.Exchange.Models;
 public sealed class InstrumentDefinition
 {
     public required string Exchange { get; init; }
-    public required string Category { get; init; }
-    public required string MarketType { get; init; }
+    public required InstrumentType InstrumentType { get; init; }
     public required string Symbol { get; init; }
     public required string BaseAsset { get; init; }
     public required string QuoteAsset { get; init; }

@@ -58,6 +58,12 @@ public sealed class DeribitInstrument
     [JsonPropertyName("option_type")]
     public string? OptionType { get; init; }
 
+    [JsonPropertyName("instrument_type")]
+    public string? InstrumentType { get; init; }
+
+    [JsonPropertyName("future_type")]
+    public string? FutureType { get; init; }
+
     [JsonPropertyName("settlement_period")]
     public string? SettlementPeriod { get; init; }
 }

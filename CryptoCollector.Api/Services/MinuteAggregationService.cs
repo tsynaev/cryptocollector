@@ -63,7 +63,7 @@ public sealed class MinuteAggregationService(
         {
             Exchange = instrument.Exchange,
             Symbol = instrument.Symbol,
-            MarketType = instrument.MarketType,
+            InstrumentType = instrument.InstrumentType,
             BaseAsset = instrument.BaseAsset,
             QuoteAsset = instrument.QuoteAsset,
             SettleAsset = instrument.SettleAsset,
@@ -458,7 +458,7 @@ public sealed class MinuteAggregationService(
                 {
                     Exchange = Instrument.Exchange,
                     Symbol = Instrument.Symbol,
-                    MarketType = Instrument.MarketType,
+                    InstrumentType = Instrument.InstrumentType,
                     BaseAsset = Instrument.BaseAsset,
                     QuoteAsset = Instrument.QuoteAsset,
                     SettleAsset = Instrument.SettleAsset,
@@ -549,7 +549,7 @@ public sealed class MinuteAggregationService(
                 {
                     Exchange = Instrument.Exchange,
                     Symbol = Instrument.Symbol,
-                    MarketType = Instrument.MarketType,
+                    InstrumentType = Instrument.InstrumentType,
                     BaseAsset = Instrument.BaseAsset,
                     QuoteAsset = Instrument.QuoteAsset,
                     SettleAsset = Instrument.SettleAsset,

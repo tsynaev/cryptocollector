@@ -218,8 +218,7 @@ public sealed class BybitApiClient(
         new()
         {
             Exchange = "bybit",
-            Category = "option",
-            MarketType = "option",
+            InstrumentType = InstrumentType.Option,
             Symbol = source.Name,
             BaseAsset = source.BaseAsset,
             QuoteAsset = source.QuoteAsset,
@@ -233,8 +232,7 @@ public sealed class BybitApiClient(
         new()
         {
             Exchange = "bybit",
-            Category = "linear",
-            MarketType = source.ContractType.ToString().Contains("Perpetual", StringComparison.OrdinalIgnoreCase) ? "perpetual" : "future",
+            InstrumentType = ResolveDerivativeInstrumentType(source),
             Symbol = source.Name,
             BaseAsset = source.BaseAsset,
             QuoteAsset = source.QuoteAsset,
@@ -243,6 +241,20 @@ public sealed class BybitApiClient(
             StrikePrice = null,
             OptionSide = null
         };
+
+    private static InstrumentType ResolveDerivativeInstrumentType(BybitLinearInverseSymbol source)
+    {
+        var isPerpetual = source.ContractType is ContractTypeV5.LinearPerpetual or ContractTypeV5.InversePerpetual;
+        var isInverse = source.SettleAsset.Equals(source.BaseAsset, StringComparison.OrdinalIgnoreCase) &&
+                        !source.QuoteAsset.Equals(source.BaseAsset, StringComparison.OrdinalIgnoreCase);
+
+        if (isPerpetual)
+        {
+            return isInverse ? InstrumentType.InversePerpetual : InstrumentType.LinearPerpetual;
+        }
+
+        return isInverse ? InstrumentType.InverseFutures : InstrumentType.LinearFutures;
+    }
 
     private static decimal? TryParseOptionStrike(string symbol)
     {

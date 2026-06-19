@@ -35,10 +35,10 @@ public sealed class DeribitExchange(
         var bootstrapFromUtc = catchUpFromUtc ?? DateTime.UtcNow.AddHours(-24);
         var bootstrapToUtc = DateTime.UtcNow;
         var optionSymbols = instruments
-            .Where(static x => x.Category.Equals("option", StringComparison.OrdinalIgnoreCase))
+            .Where(static x => x.InstrumentType == InstrumentType.Option)
             .ToDictionary(static x => x.Symbol, StringComparer.OrdinalIgnoreCase);
         var futureSymbols = instruments
-            .Where(static x => x.Category.Equals("future", StringComparison.OrdinalIgnoreCase) || x.Category.Equals("perpetual", StringComparison.OrdinalIgnoreCase))
+            .Where(static x => x.InstrumentType != InstrumentType.Option)
             .ToDictionary(static x => x.Symbol, StringComparer.OrdinalIgnoreCase);
 
         await foreach (var trade in apiClient.StreamOptionTradesAsync(_options.BaseAsset, bootstrapFromUtc, bootstrapToUtc, cancellationToken))
@@ -79,7 +79,7 @@ public sealed class DeribitExchange(
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         var futureSymbols = instruments
-            .Where(static x => x.Category.Equals("future", StringComparison.OrdinalIgnoreCase) || x.Category.Equals("perpetual", StringComparison.OrdinalIgnoreCase))
+            .Where(static x => x.InstrumentType != InstrumentType.Option)
             .ToDictionary(static x => x.Symbol, StringComparer.OrdinalIgnoreCase);
         var futureSummaries = await apiClient.GetFutureSummariesAsync(_options.BaseAsset, cancellationToken);
         var timestamp = DateTimeOffset.UtcNow;
@@ -98,7 +98,7 @@ public sealed class DeribitExchange(
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         var optionSymbols = instruments
-            .Where(static x => x.Category.Equals("option", StringComparison.OrdinalIgnoreCase))
+            .Where(static x => x.InstrumentType == InstrumentType.Option)
             .ToDictionary(static x => x.Symbol, StringComparer.OrdinalIgnoreCase);
         var snapshots = await apiClient.GetOptionChainSnapshotsAsync(cancellationToken);
         foreach (var snapshot in snapshots)
@@ -132,7 +132,7 @@ public sealed class DeribitExchange(
     {
         var instrumentMap = instruments.ToDictionary(static x => x.Symbol, StringComparer.OrdinalIgnoreCase);
         var tickerChannels = instruments
-            .Where(static x => !x.MarketType.Equals("option", StringComparison.OrdinalIgnoreCase))
+            .Where(static x => x.InstrumentType != InstrumentType.Option)
             .Select(x => $"ticker.{x.Symbol}.{GetTickerInterval()}")
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToArray();

@@ -31,7 +31,7 @@ public sealed class BybitExchange(
         DateTime? catchUpFromUtc,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        foreach (var instrument in instruments.Where(static x => x.Category.Equals("linear", StringComparison.OrdinalIgnoreCase)))
+        foreach (var instrument in instruments.Where(static x => x.InstrumentType != InstrumentType.Option))
         {
             var trades = await apiClient.GetRecentLinearTradesAsync(instrument.Symbol, cancellationToken);
             foreach (var trade in trades)
@@ -46,7 +46,7 @@ public sealed class BybitExchange(
         }
 
         var trackedOptionSymbols = instruments
-            .Where(static x => x.Category.Equals("option", StringComparison.OrdinalIgnoreCase))
+            .Where(static x => x.InstrumentType == InstrumentType.Option)
             .ToDictionary(static x => x.Symbol, StringComparer.OrdinalIgnoreCase);
         var optionTrades = await apiClient.GetRecentOptionTradesAsync(_options.BaseAsset, cancellationToken);
 
@@ -71,7 +71,7 @@ public sealed class BybitExchange(
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         var trackedSymbols = instruments
-            .Where(static x => x.Category.Equals("linear", StringComparison.OrdinalIgnoreCase))
+            .Where(static x => x.InstrumentType != InstrumentType.Option)
             .ToDictionary(static x => x.Symbol, StringComparer.OrdinalIgnoreCase);
         var tickers = await apiClient.GetLinearTickersAsync(_options.BaseAsset, cancellationToken);
         var timestamp = DateTimeOffset.UtcNow;
@@ -90,7 +90,7 @@ public sealed class BybitExchange(
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         var trackedSymbols = instruments
-            .Where(static x => x.Category.Equals("option", StringComparison.OrdinalIgnoreCase))
+            .Where(static x => x.InstrumentType == InstrumentType.Option)
             .ToDictionary(static x => x.Symbol, StringComparer.OrdinalIgnoreCase);
         var snapshots = await apiClient.GetOptionChainSnapshotsAsync(cancellationToken);
         foreach (var snapshot in snapshots)
@@ -123,9 +123,9 @@ public sealed class BybitExchange(
         CancellationToken cancellationToken)
     {
         var subscriptions = new List<UpdateSubscription>();
-        var linearInstruments = instruments.Where(static x => x.Category.Equals("linear", StringComparison.OrdinalIgnoreCase));
+        var linearInstruments = instruments.Where(static x => x.InstrumentType != InstrumentType.Option);
         var optionSymbols = instruments
-            .Where(static x => x.Category.Equals("option", StringComparison.OrdinalIgnoreCase))
+            .Where(static x => x.InstrumentType == InstrumentType.Option)
             .ToDictionary(static x => x.Symbol, StringComparer.OrdinalIgnoreCase);
         var linearSymbols = linearInstruments.ToDictionary(static x => x.Symbol, StringComparer.OrdinalIgnoreCase);
         var connectionClosedSignal = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);

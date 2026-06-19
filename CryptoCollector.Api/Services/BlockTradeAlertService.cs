@@ -173,7 +173,7 @@ public sealed class BlockTradeAlertService(
         var leg = new BlockTradeLeg(
             instrument.Exchange,
             instrument.Symbol,
-            instrument.MarketType,
+            instrument.InstrumentType,
             instrument.BaseAsset,
             instrument.QuoteAsset,
             instrument.SettleAsset,
@@ -242,7 +242,7 @@ public sealed class BlockTradeAlertService(
         var leg = new BlockTradeLeg(
             trade.Exchange,
             trade.Symbol,
-            trade.MarketType,
+            trade.InstrumentType,
             trade.BaseAsset,
             trade.QuoteAsset,
             trade.SettleAsset,
@@ -436,12 +436,12 @@ public sealed class BlockTradeAlertService(
     {
         var sections = new List<string>();
         var optionGroups = orderedLegs
-            .Where(static x => x.MarketType.Equals("option", StringComparison.OrdinalIgnoreCase))
+            .Where(static x => x.InstrumentType == InstrumentType.Option)
             .GroupBy(static x => x.ExpiryUtc)
             .OrderBy(static x => x.Key ?? DateTime.MaxValue)
             .ToArray();
         var nonOptionLegs = orderedLegs
-            .Where(static x => !x.MarketType.Equals("option", StringComparison.OrdinalIgnoreCase))
+            .Where(static x => x.InstrumentType != InstrumentType.Option)
             .ToArray();
 
         foreach (var optionGroup in optionGroups)
@@ -479,7 +479,7 @@ public sealed class BlockTradeAlertService(
         var side = CultureInfo.InvariantCulture.TextInfo.ToTitleCase(leg.Side.ToLowerInvariant());
         var quantity = ResolveDisplayQuantity(leg).ToString("0.####", CultureInfo.InvariantCulture);
 
-        if (leg.MarketType.Equals("option", StringComparison.OrdinalIgnoreCase))
+        if (leg.InstrumentType == InstrumentType.Option)
         {
             var strike = leg.StrikePrice?.ToString(CultureInfo.InvariantCulture) ?? "-";
             var optionSide = string.IsNullOrWhiteSpace(leg.OptionSide)
@@ -679,7 +679,7 @@ public sealed class BlockTradeAlertService(
     {
         var sideSign = leg.Leg.Side.Equals("buy", StringComparison.OrdinalIgnoreCase) ? 1m : -1m;
 
-        if (leg.Leg.MarketType.Equals("option", StringComparison.OrdinalIgnoreCase))
+        if (leg.Leg.InstrumentType == InstrumentType.Option)
         {
             if (leg.Leg.StrikePrice is null || string.IsNullOrWhiteSpace(leg.Leg.OptionSide))
             {
@@ -701,7 +701,7 @@ public sealed class BlockTradeAlertService(
     {
         var sideSign = leg.Leg.Side.Equals("buy", StringComparison.OrdinalIgnoreCase) ? 1m : -1m;
 
-        if (leg.Leg.MarketType.Equals("option", StringComparison.OrdinalIgnoreCase))
+        if (leg.Leg.InstrumentType == InstrumentType.Option)
         {
             if (leg.Leg.StrikePrice is null || string.IsNullOrWhiteSpace(leg.Leg.OptionSide))
             {
@@ -723,7 +723,7 @@ public sealed class BlockTradeAlertService(
 
     private async Task<ConvertedOptionAmounts?> TryConvertOptionAmountsAsync(BlockTradeLeg leg, CancellationToken cancellationToken)
     {
-        if (!leg.MarketType.Equals("option", StringComparison.OrdinalIgnoreCase) ||
+        if (leg.InstrumentType != InstrumentType.Option ||
             !IsPriceQuotedInBaseAsset(leg))
         {
             return null;
@@ -766,7 +766,7 @@ public sealed class BlockTradeAlertService(
 
     private Task<decimal> ResolveLegUsdNotionalAsync(BlockTradeLeg leg, decimal? underlyingPrice)
     {
-        if (leg.MarketType.Equals("option", StringComparison.OrdinalIgnoreCase))
+        if (leg.InstrumentType == InstrumentType.Option)
         {
             if (IsUsdLike(leg.SettleAsset) || IsUsdLike(leg.QuoteAsset))
             {
@@ -855,7 +855,7 @@ public sealed class BlockTradeAlertService(
             DataSetNames.Tickers,
             symbol: null,
             row => row.BaseAsset.Equals(leg.BaseAsset, StringComparison.OrdinalIgnoreCase) &&
-                   !row.MarketType.Equals("option", StringComparison.OrdinalIgnoreCase) &&
+                   row.InstrumentType != InstrumentType.Option &&
                    MatchesUnderlyingSnapshot(row, leg, requireTimestampMatch),
             cancellationToken);
         var tickerSnapshot = tickerSnapshots
@@ -921,7 +921,7 @@ public sealed class BlockTradeAlertService(
 
     private static decimal ResolveDisplayQuantity(BlockTradeLeg leg)
     {
-        if (!leg.MarketType.Equals("option", StringComparison.OrdinalIgnoreCase) &&
+        if (leg.InstrumentType != InstrumentType.Option &&
             IsUsdLike(leg.QuoteAsset) &&
             IsPriceQuotedInBaseAsset(leg))
         {
@@ -936,7 +936,7 @@ public sealed class BlockTradeAlertService(
     }
 
     private static decimal EstimateStandaloneTradeUsdNotional(
-        string marketType,
+        InstrumentType instrumentType,
         string baseAsset,
         string quoteAsset,
         string settleAsset,
@@ -946,7 +946,7 @@ public sealed class BlockTradeAlertService(
         decimal? indexPrice,
         decimal? markPrice)
     {
-        if (marketType.Equals("option", StringComparison.OrdinalIgnoreCase))
+        if (instrumentType == InstrumentType.Option)
         {
             if (IsUsdLike(settleAsset) || IsUsdLike(quoteAsset))
             {
@@ -990,18 +990,17 @@ public sealed class BlockTradeAlertService(
 
     private static string ResolveNonOptionType(BlockTradeLeg leg)
     {
-        if (leg.Symbol.Contains("PERPETUAL", StringComparison.OrdinalIgnoreCase))
+        if (leg.InstrumentType is InstrumentType.InversePerpetual or InstrumentType.LinearPerpetual)
         {
             return "PERP";
         }
 
-        if (leg.MarketType.Equals("future", StringComparison.OrdinalIgnoreCase) ||
-            leg.MarketType.Equals("futures", StringComparison.OrdinalIgnoreCase))
+        if (leg.InstrumentType is InstrumentType.InverseFutures or InstrumentType.LinearFutures)
         {
             return "FUT";
         }
 
-        return leg.MarketType.ToUpperInvariant();
+        return leg.InstrumentType.ToString().ToUpperInvariant();
     }
 
     private decimal ResolveVolatility(BlockTradeLeg leg) =>
@@ -1085,7 +1084,7 @@ public sealed class BlockTradeAlertService(
         }
 
         if (EstimateStandaloneTradeUsdNotional(
-                instrument.MarketType,
+                instrument.InstrumentType,
                 instrument.BaseAsset,
                 instrument.QuoteAsset,
                 instrument.SettleAsset,
@@ -1129,7 +1128,7 @@ public sealed class BlockTradeAlertService(
         }
 
         if (EstimateStandaloneTradeUsdNotional(
-                trade.MarketType,
+                trade.InstrumentType,
                 trade.BaseAsset,
                 trade.QuoteAsset,
                 trade.SettleAsset,
@@ -1246,7 +1245,7 @@ public sealed class BlockTradeAlertService(
     private sealed record BlockTradeLeg(
         string Exchange,
         string Symbol,
-        string MarketType,
+        InstrumentType InstrumentType,
         string BaseAsset,
         string QuoteAsset,
         string SettleAsset,

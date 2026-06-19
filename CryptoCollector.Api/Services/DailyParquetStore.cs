@@ -202,35 +202,79 @@ public sealed class DailyParquetStore(IOptions<StorageOptions> options)
                 .Select(static x => (T)(ITimeSeriesRecord)x)
                 .ToArray();
         }
+        catch (ParquetException) when (typeof(T) == typeof(TickerMinuteBar))
+        {
+            return (await ReadLegacyTickerRowsAsync(filePath, cancellationToken))
+                .Select(static x => (T)(ITimeSeriesRecord)x)
+                .ToArray();
+        }
+        catch (ParquetException) when (typeof(T) == typeof(OptionChainMinuteBar))
+        {
+            return (await ReadLegacyOptionChainRowsAsync(filePath, cancellationToken))
+                .Select(static x => (T)(ITimeSeriesRecord)x)
+                .ToArray();
+        }
     }
 
     private async Task MigrateAndRewriteAsync<T>(string filePath, IReadOnlyCollection<T> newRows, CancellationToken cancellationToken)
         where T : class, ITimeSeriesRecord
     {
-        if (typeof(T) != typeof(TradeRecord))
+        if (typeof(T) == typeof(TradeRecord))
         {
-            throw new ParquetException($"Schema migration is not implemented for {typeof(T).Name}.");
+            var mergedRows = (await ReadLegacyTradeRowsAsync(filePath, cancellationToken))
+                .Concat(newRows.Cast<TradeRecord>())
+                .OrderBy(static x => x.Date)
+                .ThenBy(static x => x.Symbol, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+
+            await RewriteAsync(filePath, mergedRows, cancellationToken);
+            return;
         }
 
-        var mergedRows = (await ReadLegacyTradeRowsAsync(filePath, cancellationToken))
-            .Concat(newRows.Cast<TradeRecord>())
-            .OrderBy(static x => x.Date)
-            .ThenBy(static x => x.Symbol, StringComparer.OrdinalIgnoreCase)
-            .ToArray();
+        if (typeof(T) == typeof(TickerMinuteBar))
+        {
+            var mergedRows = (await ReadLegacyTickerRowsAsync(filePath, cancellationToken))
+                .Concat(newRows.Cast<TickerMinuteBar>())
+                .OrderBy(static x => x.Date)
+                .ThenBy(static x => x.Symbol, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
 
-        await ParquetSerializer.SerializeAsync(
-            mergedRows,
-            filePath,
-            new ParquetOptions
-            {
-                CompressionMethod = _parquetOptions.CompressionMethod,
-                Append = false
-            },
-            cancellationToken: cancellationToken);
+            await RewriteAsync(filePath, mergedRows, cancellationToken);
+            return;
+        }
+
+        if (typeof(T) == typeof(OptionChainMinuteBar))
+        {
+            var mergedRows = (await ReadLegacyOptionChainRowsAsync(filePath, cancellationToken))
+                .Concat(newRows.Cast<OptionChainMinuteBar>())
+                .OrderBy(static x => x.Date)
+                .ThenBy(static x => x.Symbol, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+
+            await RewriteAsync(filePath, mergedRows, cancellationToken);
+            return;
+        }
+
+        throw new ParquetException($"Schema migration is not implemented for {typeof(T).Name}.");
     }
 
     private async Task<IReadOnlyList<TradeRecord>> ReadLegacyTradeRowsAsync(string filePath, CancellationToken cancellationToken)
     {
+        try
+        {
+            var legacyRowsV3 = await ParquetSerializer.DeserializeAsync<LegacyTradeRecordV3>(
+                filePath,
+                _parquetOptions,
+                cancellationToken: cancellationToken);
+
+            return legacyRowsV3.Data
+                .Select(static x => x.Upgrade())
+                .ToArray();
+        }
+        catch (ParquetException)
+        {
+        }
+
         try
         {
             var legacyRowsV2 = await ParquetSerializer.DeserializeAsync<LegacyTradeRecordV2>(
@@ -253,6 +297,43 @@ public sealed class DailyParquetStore(IOptions<StorageOptions> options)
                 .Select(static x => x.Upgrade())
                 .ToArray();
         }
+    }
+
+    private async Task<IReadOnlyList<TickerMinuteBar>> ReadLegacyTickerRowsAsync(string filePath, CancellationToken cancellationToken)
+    {
+        var legacyRows = await ParquetSerializer.DeserializeAsync<LegacyTickerMinuteBarV1>(
+            filePath,
+            _parquetOptions,
+            cancellationToken: cancellationToken);
+
+        return legacyRows.Data
+            .Select(static x => x.Upgrade())
+            .ToArray();
+    }
+
+    private async Task<IReadOnlyList<OptionChainMinuteBar>> ReadLegacyOptionChainRowsAsync(string filePath, CancellationToken cancellationToken)
+    {
+        var legacyRows = await ParquetSerializer.DeserializeAsync<LegacyOptionChainMinuteBarV1>(
+            filePath,
+            _parquetOptions,
+            cancellationToken: cancellationToken);
+
+        return legacyRows.Data
+            .Select(static x => x.Upgrade())
+            .ToArray();
+    }
+
+    private Task RewriteAsync<T>(string filePath, IReadOnlyCollection<T> rows, CancellationToken cancellationToken)
+    {
+        return ParquetSerializer.SerializeAsync(
+            rows,
+            filePath,
+            new ParquetOptions
+            {
+                CompressionMethod = _parquetOptions.CompressionMethod,
+                Append = false
+            },
+            cancellationToken: cancellationToken);
     }
 
     private async Task WithFileLockAsync(string filePath, Func<Task> action, CancellationToken cancellationToken)
