@@ -162,7 +162,7 @@ public sealed class BlockTradeAlertService(
             return;
         }
 
-        if (!_options.Enabled || !TryResolveAlertGroupKey(trade, out var groupKey, out var groupId, out var groupType))
+        if (!_options.Enabled || !TryResolveAlertGroupKey(instrument, trade, out var groupKey, out var groupId, out var groupType))
         {
             return;
         }
@@ -509,7 +509,7 @@ public sealed class BlockTradeAlertService(
         return new FormattedLegRow(
             side,
             quantity,
-            string.Empty,
+            ResolveNonOptionType(leg),
             string.Empty,
             leg.Price.ToString("0.0000", CultureInfo.InvariantCulture),
             string.Empty);
@@ -908,7 +908,10 @@ public sealed class BlockTradeAlertService(
     }
 
     private static bool IsPriceQuotedInBaseAsset(BlockTradeLeg leg) =>
-        leg.SettleAsset.Equals(leg.BaseAsset, StringComparison.OrdinalIgnoreCase);
+        IsPriceQuotedInBaseAsset(leg.BaseAsset, leg.SettleAsset);
+
+    private static bool IsPriceQuotedInBaseAsset(string baseAsset, string settleAsset) =>
+        settleAsset.Equals(baseAsset, StringComparison.OrdinalIgnoreCase);
 
     private static bool IsUsdLike(string? asset) =>
         asset is not null &&
@@ -930,6 +933,75 @@ public sealed class BlockTradeAlertService(
         }
 
         return leg.Quantity;
+    }
+
+    private static decimal EstimateStandaloneTradeUsdNotional(
+        string marketType,
+        string baseAsset,
+        string quoteAsset,
+        string settleAsset,
+        decimal quantity,
+        decimal? amount,
+        decimal price,
+        decimal? indexPrice,
+        decimal? markPrice)
+    {
+        if (marketType.Equals("option", StringComparison.OrdinalIgnoreCase))
+        {
+            if (IsUsdLike(settleAsset) || IsUsdLike(quoteAsset))
+            {
+                return Math.Abs(price * quantity);
+            }
+
+            if (IsPriceQuotedInBaseAsset(baseAsset, settleAsset))
+            {
+                var underlyingPrice = indexPrice ?? markPrice;
+                return underlyingPrice is > 0
+                    ? Math.Abs(price * quantity * underlyingPrice.Value)
+                    : 0m;
+            }
+
+            return 0m;
+        }
+
+        if (amount is not null && IsUsdLike(quoteAsset))
+        {
+            return Math.Abs(amount.Value);
+        }
+
+        if (IsUsdLike(quoteAsset) || IsUsdLike(settleAsset))
+        {
+            if (IsPriceQuotedInBaseAsset(baseAsset, settleAsset))
+            {
+                var referencePrice = indexPrice ?? markPrice;
+                return referencePrice is > 0
+                    ? Math.Abs((quantity / referencePrice.Value) * price)
+                    : 0m;
+            }
+
+            return Math.Abs(price * quantity);
+        }
+
+        var assetPrice = indexPrice ?? markPrice;
+        return assetPrice is > 0
+            ? Math.Abs(quantity * assetPrice.Value)
+            : 0m;
+    }
+
+    private static string ResolveNonOptionType(BlockTradeLeg leg)
+    {
+        if (leg.Symbol.Contains("PERPETUAL", StringComparison.OrdinalIgnoreCase))
+        {
+            return "PERP";
+        }
+
+        if (leg.MarketType.Equals("future", StringComparison.OrdinalIgnoreCase) ||
+            leg.MarketType.Equals("futures", StringComparison.OrdinalIgnoreCase))
+        {
+            return "FUT";
+        }
+
+        return leg.MarketType.ToUpperInvariant();
     }
 
     private decimal ResolveVolatility(BlockTradeLeg leg) =>
@@ -993,45 +1065,38 @@ public sealed class BlockTradeAlertService(
     private static string BuildTradeKey(string exchange, string symbol, string tradeId, DateTime timestampUtc) =>
         $"{exchange}|{symbol}|{tradeId}|{timestampUtc:O}";
 
-    private static bool TryResolveAlertGroupKey(
+    private bool TryResolveAlertGroupKey(
+        InstrumentDefinition instrument,
         ExchangeTrade trade,
         out string groupKey,
         out string groupId,
         out string groupType)
     {
-        if (TryResolveAlertGroupIdentity(
-                "block_trade_id",
+        if (TryResolveStructuredAlertGroupKey(
                 trade.BlockTradeId,
-                out groupId,
-                out groupType))
-        {
-            groupKey = $"{groupType}|{groupId}";
-            return true;
-        }
-
-        if (TryResolveAlertGroupIdentity(
-                "block_rfq_id",
                 trade.BlockRfqId,
-                out groupId,
-                out groupType))
-        {
-            groupKey = $"{groupType}|{groupId}";
-            return true;
-        }
-
-        if (TryResolveAlertGroupIdentity(
-                "combo_trade_id",
                 trade.ComboTradeId,
+                trade.ComboId,
+                out groupKey,
                 out groupId,
                 out groupType))
         {
-            groupKey = $"{groupType}|{groupId}";
             return true;
         }
 
-        if (TryResolveAlertGroupIdentity(
-                "combo_id",
-                trade.ComboId,
+        if (EstimateStandaloneTradeUsdNotional(
+                instrument.MarketType,
+                instrument.BaseAsset,
+                instrument.QuoteAsset,
+                instrument.SettleAsset,
+                trade.Quantity,
+                trade.Amount,
+                trade.Price,
+                trade.IndexPrice,
+                trade.MarkPrice) >= _options.MinGroupUsd &&
+            TryResolveAlertGroupIdentity(
+                "trade_id",
+                trade.TradeId,
                 out groupId,
                 out groupType))
         {
@@ -1045,35 +1110,37 @@ public sealed class BlockTradeAlertService(
         return false;
     }
 
-    private static bool TryResolveAlertGroupKey(
+    private bool TryResolveAlertGroupKey(
         TradeRecord trade,
         out string groupKey,
         out string groupId,
         out string groupType)
     {
-        if (TryResolveAlertGroupIdentity(
-                "block_trade_id",
+        if (TryResolveStructuredAlertGroupKey(
                 trade.BlockTradeId,
-                out groupId,
-                out groupType))
-        {
-            groupKey = $"{groupType}|{groupId}";
-            return true;
-        }
-
-        if (TryResolveAlertGroupIdentity(
-                "block_rfq_id",
                 trade.BlockRfqId,
-                out groupId,
-                out groupType))
-        {
-            groupKey = $"{groupType}|{groupId}";
-            return true;
-        }
-
-        if (TryResolveAlertGroupIdentity(
-                "combo_trade_id",
                 trade.ComboTradeId,
+                trade.ComboId,
+                out groupKey,
+                out groupId,
+                out groupType))
+        {
+            return true;
+        }
+
+        if (EstimateStandaloneTradeUsdNotional(
+                trade.MarketType,
+                trade.BaseAsset,
+                trade.QuoteAsset,
+                trade.SettleAsset,
+                trade.Quantity,
+                trade.Amount,
+                trade.Price,
+                trade.IndexPrice,
+                trade.MarkPrice) >= _options.MinGroupUsd &&
+            TryResolveAlertGroupIdentity(
+                "trade_id",
+                trade.TradeId,
                 out groupId,
                 out groupType))
         {
@@ -1081,11 +1148,25 @@ public sealed class BlockTradeAlertService(
             return true;
         }
 
-        if (TryResolveAlertGroupIdentity(
-                "combo_id",
-                trade.ComboId,
-                out groupId,
-                out groupType))
+        groupKey = string.Empty;
+        groupId = string.Empty;
+        groupType = string.Empty;
+        return false;
+    }
+
+    private static bool TryResolveStructuredAlertGroupKey(
+        string? blockTradeId,
+        string? blockRfqId,
+        string? comboTradeId,
+        string? comboId,
+        out string groupKey,
+        out string groupId,
+        out string groupType)
+    {
+        if (TryResolveAlertGroupIdentity("block_trade_id", blockTradeId, out groupId, out groupType) ||
+            TryResolveAlertGroupIdentity("block_rfq_id", blockRfqId, out groupId, out groupType) ||
+            TryResolveAlertGroupIdentity("combo_trade_id", comboTradeId, out groupId, out groupType) ||
+            TryResolveAlertGroupIdentity("combo_id", comboId, out groupId, out groupType))
         {
             groupKey = $"{groupType}|{groupId}";
             return true;
