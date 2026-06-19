@@ -159,7 +159,7 @@ public sealed class BlockTradeAlertService(
             return;
         }
 
-        if (!_options.Enabled || !trade.IsBlockTrade || string.IsNullOrWhiteSpace(trade.BlockTradeId))
+        if (!_options.Enabled || !TryResolveAlertGroupKey(trade, out var groupKey, out var groupId, out var groupType))
         {
             return;
         }
@@ -179,13 +179,18 @@ public sealed class BlockTradeAlertService(
             instrument.OptionSide,
             trade.Side,
             quantity,
+            trade.Contracts,
+            trade.Amount,
             price,
+            trade.MarkPrice,
+            trade.IndexPrice,
             price * quantity,
-            trade.BlockTradeId!,
+            groupId,
+            groupType,
             timestamp);
 
         _groups.AddOrUpdate(
-            $"{instrument.Exchange}|{trade.BlockTradeId}",
+            $"{instrument.Exchange}|{groupKey}",
             _ => new BlockTradeGroup(leg, _options.GroupWindow),
             (_, existing) =>
             {
@@ -224,7 +229,7 @@ public sealed class BlockTradeAlertService(
             return;
         }
 
-        if (!_options.Enabled || !trade.IsBlockTrade || string.IsNullOrWhiteSpace(trade.BlockTradeId))
+        if (!_options.Enabled || !TryResolveAlertGroupKey(trade, out var groupKey, out var groupId, out var groupType))
         {
             return;
         }
@@ -241,13 +246,18 @@ public sealed class BlockTradeAlertService(
             trade.OptionSide,
             trade.Side,
             trade.Quantity,
+            trade.Contracts,
+            trade.Amount,
             trade.Price,
+            trade.MarkPrice,
+            trade.IndexPrice,
             trade.Notional,
-            trade.BlockTradeId!,
+            groupId,
+            groupType,
             trade.Date);
 
         _groups.AddOrUpdate(
-            $"{trade.Exchange}|{trade.BlockTradeId}",
+            $"{trade.Exchange}|{groupKey}",
             _ => new BlockTradeGroup(leg, _options.GroupWindow),
             (_, existing) =>
             {
@@ -336,7 +346,8 @@ public sealed class BlockTradeAlertService(
                 continue;
             }
 
-            if (group.TotalQuantity <= _options.QuantityThreshold)
+            var totalUsdNotional = await ResolveGroupUsdNotionalAsync(group, cancellationToken);
+            if (totalUsdNotional < _options.MinGroupUsd)
             {
                 continue;
             }
@@ -345,11 +356,13 @@ public sealed class BlockTradeAlertService(
             if (messageQueue.TryEnqueue(message))
             {
                 logger.LogInformation(
-                    "Enqueued block trade alert. Exchange={Exchange}, BlockTradeId={BlockTradeId}, Legs={LegCount}, TotalQuantity={TotalQuantity}.",
+                    "Enqueued block trade alert. Exchange={Exchange}, GroupType={GroupType}, GroupId={GroupId}, Legs={LegCount}, TotalQuantity={TotalQuantity}, TotalUsdNotional={TotalUsdNotional}.",
                     group.Exchange,
-                    group.BlockTradeId,
+                    group.GroupType,
+                    group.GroupId,
                     group.Legs.Count,
-                    group.TotalQuantity);
+                    group.TotalQuantity,
+                    totalUsdNotional);
             }
         }
     }
@@ -363,14 +376,20 @@ public sealed class BlockTradeAlertService(
             .ToArray();
         var timestamp = orderedLegs[0].TimestampUtc;
         var legLines = await FormatLegLinesAsync(orderedLegs, cancellationToken);
+        var baseAsset = orderedLegs
+            .Select(static x => x.BaseAsset)
+            .FirstOrDefault(static x => !string.IsNullOrWhiteSpace(x));
+        var headerSuffix = string.IsNullOrWhiteSpace(baseAsset)
+            ? string.Empty
+            : $" ({encoder.Encode(baseAsset.ToUpperInvariant())})";
 
         return string.Join('\n',
         [
-            $"<b>BLOCK TRADE {encoder.Encode(group.Exchange.ToUpperInvariant())}</b>",
+            $"<b>BLOCK TRADE {encoder.Encode(group.Exchange.ToUpperInvariant())}{headerSuffix}</b>",
             $"{timestamp:dd MMMM yyyy HH:mm:ss} UTC",
             string.Empty,
             .. legLines,
-            $"<code>{encoder.Encode(group.BlockTradeId)}</code>"
+            $"<code>{encoder.Encode(group.GroupId)}</code>"
         ]);
     }
 
@@ -435,7 +454,7 @@ public sealed class BlockTradeAlertService(
             var strike = leg.StrikePrice?.ToString(CultureInfo.InvariantCulture) ?? "-";
             if (await TryConvertOptionAmountsAsync(leg, cancellationToken) is { } converted)
             {
-                return $"{side} {quantity} {optionSide} {strike} @ {converted.UnitPriceText} ({converted.TotalPremiumText})";
+                return $"{side} {quantity} {optionSide} {strike} @ {converted.UnitPriceText} ({converted.TotalPremiumValueText})";
             }
 
             var settleAsset = leg.SettleAsset;
@@ -471,11 +490,68 @@ public sealed class BlockTradeAlertService(
 
         return new ConvertedOptionAmounts(
             $"{unitPrice.ToString("0.00", CultureInfo.InvariantCulture)} {displayCurrency}",
+            $"{totalPremium.ToString("0.00", CultureInfo.InvariantCulture)}",
             $"{totalPremium.ToString("0.00", CultureInfo.InvariantCulture)} {displayCurrency}");
+    }
+
+    private async Task<decimal> ResolveGroupUsdNotionalAsync(BlockTradeGroup group, CancellationToken cancellationToken)
+    {
+        decimal total = 0m;
+
+        foreach (var leg in group.Legs)
+        {
+            total += await ResolveLegUsdNotionalAsync(leg, cancellationToken);
+        }
+
+        return total;
+    }
+
+    private async Task<decimal> ResolveLegUsdNotionalAsync(BlockTradeLeg leg, CancellationToken cancellationToken)
+    {
+        if (leg.MarketType.Equals("option", StringComparison.OrdinalIgnoreCase))
+        {
+            if (IsUsdLike(leg.SettleAsset) || IsUsdLike(leg.QuoteAsset))
+            {
+                return Math.Abs(leg.Notional);
+            }
+
+            if (IsPriceQuotedInBaseAsset(leg))
+            {
+                var underlyingPrice = await ResolveUnderlyingPriceAsync(leg, cancellationToken);
+                return underlyingPrice is > 0 ? Math.Abs(leg.Notional * underlyingPrice.Value) : 0m;
+            }
+
+            return 0m;
+        }
+
+        if (leg.Amount is not null && IsUsdLike(leg.QuoteAsset))
+        {
+            return Math.Abs(leg.Amount.Value);
+        }
+
+        if (IsUsdLike(leg.QuoteAsset) || IsUsdLike(leg.SettleAsset))
+        {
+            return Math.Abs(leg.Price * ResolveDisplayQuantity(leg));
+        }
+
+        var assetPrice = await ResolveUnderlyingPriceAsync(leg, cancellationToken);
+        return assetPrice is > 0
+            ? Math.Abs(ResolveDisplayQuantity(leg) * assetPrice.Value)
+            : 0m;
     }
 
     private async Task<decimal?> ResolveUnderlyingPriceAsync(BlockTradeLeg leg, CancellationToken cancellationToken)
     {
+        if (leg.IndexPrice is > 0)
+        {
+            return leg.IndexPrice.Value;
+        }
+
+        if (leg.MarkPrice is > 0)
+        {
+            return leg.MarkPrice.Value;
+        }
+
         return await TryResolveUnderlyingPriceAsync(leg, requireTimestampMatch: true, cancellationToken) ??
                await TryResolveUnderlyingPriceAsync(leg, requireTimestampMatch: false, cancellationToken);
     }
@@ -558,6 +634,28 @@ public sealed class BlockTradeAlertService(
     private static bool IsPriceQuotedInBaseAsset(BlockTradeLeg leg) =>
         leg.SettleAsset.Equals(leg.BaseAsset, StringComparison.OrdinalIgnoreCase);
 
+    private static bool IsUsdLike(string? asset) =>
+        asset is not null &&
+        (asset.Equals("USD", StringComparison.OrdinalIgnoreCase) ||
+         asset.Equals("USDT", StringComparison.OrdinalIgnoreCase) ||
+         asset.Equals("USDC", StringComparison.OrdinalIgnoreCase));
+
+    private static decimal ResolveDisplayQuantity(BlockTradeLeg leg)
+    {
+        if (!leg.MarketType.Equals("option", StringComparison.OrdinalIgnoreCase) &&
+            IsUsdLike(leg.QuoteAsset) &&
+            IsPriceQuotedInBaseAsset(leg))
+        {
+            var referencePrice = leg.IndexPrice ?? leg.MarkPrice;
+            if (referencePrice is > 0)
+            {
+                return leg.Quantity / referencePrice.Value;
+            }
+        }
+
+        return leg.Quantity;
+    }
+
     private static bool MatchesUnderlyingSnapshot(OptionChainMinuteBar row, BlockTradeLeg leg, bool requireTimestampMatch) =>
         (!requireTimestampMatch || row.Date <= leg.TimestampUtc) &&
         ((row.UnderlyingPrice ?? row.IndexPrice) ?? 0m) > 0;
@@ -569,6 +667,128 @@ public sealed class BlockTradeAlertService(
     private static string BuildTradeKey(string exchange, string symbol, string tradeId, DateTime timestampUtc) =>
         $"{exchange}|{symbol}|{tradeId}|{timestampUtc:O}";
 
+    private static bool TryResolveAlertGroupKey(
+        ExchangeTrade trade,
+        out string groupKey,
+        out string groupId,
+        out string groupType)
+    {
+        if (TryResolveAlertGroupIdentity(
+                "block_trade_id",
+                trade.BlockTradeId,
+                out groupId,
+                out groupType))
+        {
+            groupKey = $"{groupType}|{groupId}";
+            return true;
+        }
+
+        if (TryResolveAlertGroupIdentity(
+                "block_rfq_id",
+                trade.BlockRfqId,
+                out groupId,
+                out groupType))
+        {
+            groupKey = $"{groupType}|{groupId}";
+            return true;
+        }
+
+        if (TryResolveAlertGroupIdentity(
+                "combo_trade_id",
+                trade.ComboTradeId,
+                out groupId,
+                out groupType))
+        {
+            groupKey = $"{groupType}|{groupId}";
+            return true;
+        }
+
+        if (TryResolveAlertGroupIdentity(
+                "combo_id",
+                trade.ComboId,
+                out groupId,
+                out groupType))
+        {
+            groupKey = $"{groupType}|{groupId}";
+            return true;
+        }
+
+        groupKey = string.Empty;
+        groupId = string.Empty;
+        groupType = string.Empty;
+        return false;
+    }
+
+    private static bool TryResolveAlertGroupKey(
+        TradeRecord trade,
+        out string groupKey,
+        out string groupId,
+        out string groupType)
+    {
+        if (TryResolveAlertGroupIdentity(
+                "block_trade_id",
+                trade.BlockTradeId,
+                out groupId,
+                out groupType))
+        {
+            groupKey = $"{groupType}|{groupId}";
+            return true;
+        }
+
+        if (TryResolveAlertGroupIdentity(
+                "block_rfq_id",
+                trade.BlockRfqId,
+                out groupId,
+                out groupType))
+        {
+            groupKey = $"{groupType}|{groupId}";
+            return true;
+        }
+
+        if (TryResolveAlertGroupIdentity(
+                "combo_trade_id",
+                trade.ComboTradeId,
+                out groupId,
+                out groupType))
+        {
+            groupKey = $"{groupType}|{groupId}";
+            return true;
+        }
+
+        if (TryResolveAlertGroupIdentity(
+                "combo_id",
+                trade.ComboId,
+                out groupId,
+                out groupType))
+        {
+            groupKey = $"{groupType}|{groupId}";
+            return true;
+        }
+
+        groupKey = string.Empty;
+        groupId = string.Empty;
+        groupType = string.Empty;
+        return false;
+    }
+
+    private static bool TryResolveAlertGroupIdentity(
+        string type,
+        string? value,
+        out string groupId,
+        out string groupType)
+    {
+        if (!string.IsNullOrWhiteSpace(value))
+        {
+            groupId = value;
+            groupType = type;
+            return true;
+        }
+
+        groupId = string.Empty;
+        groupType = string.Empty;
+        return false;
+    }
+
     private sealed class BlockTradeGroup
     {
         private readonly Lock _gate = new();
@@ -577,14 +797,16 @@ public sealed class BlockTradeAlertService(
         public BlockTradeGroup(BlockTradeLeg firstLeg, TimeSpan groupWindow)
         {
             Exchange = firstLeg.Exchange;
-            BlockTradeId = firstLeg.BlockTradeId;
+            GroupId = firstLeg.GroupId;
+            GroupType = firstLeg.GroupType;
             _legs.Add(firstLeg);
             TotalQuantity = firstLeg.Quantity;
             FlushAfterUtc = firstLeg.TimestampUtc.Add(groupWindow);
         }
 
         public string Exchange { get; }
-        public string BlockTradeId { get; }
+        public string GroupId { get; }
+        public string GroupType { get; }
         public DateTime FlushAfterUtc { get; private set; }
         public decimal TotalQuantity { get; private set; }
 
@@ -626,11 +848,16 @@ public sealed class BlockTradeAlertService(
         string? OptionSide,
         string Side,
         decimal Quantity,
+        decimal? Contracts,
+        decimal? Amount,
         decimal Price,
+        decimal? MarkPrice,
+        decimal? IndexPrice,
         decimal Notional,
-        string BlockTradeId,
+        string GroupId,
+        string GroupType,
         DateTime TimestampUtc);
 
-    private sealed record ConvertedOptionAmounts(string UnitPriceText, string TotalPremiumText);
+    private sealed record ConvertedOptionAmounts(string UnitPriceText, string TotalPremiumValueText, string TotalPremiumText);
     private sealed record PendingTrade(InstrumentDefinition Instrument, ExchangeTrade Trade, bool UpdateCursor);
 }
