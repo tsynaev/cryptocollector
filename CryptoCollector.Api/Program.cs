@@ -9,6 +9,7 @@ using CryptoCollector.Exchange.Deribit.Services;
 using CryptoCollector.Exchange.Binance;
 using CryptoCollector.Exchange.Bybit;
 using CryptoCollector.Exchange.Deribit;
+using Microsoft.Extensions.Options;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -136,6 +137,69 @@ app.MapGet("/history/trades", async (
 .WithName("GetTradeHistory")
 .WithSummary("Get raw trade history.")
 .WithDescription("Returns persisted trade rows from local Parquet storage. Default period is the last 24 hours when 'from' and 'to' are omitted. When 'exchange' is omitted, rows are returned across all supported exchanges.")
+.WithTags("History");
+
+app.MapGet("/history/block-trades", async (
+    string? exchange,
+    DateTimeOffset? from,
+    DateTimeOffset? to,
+    decimal? totalQuantity,
+    decimal? minGroupUsd,
+    DailyParquetStore store,
+    CancellationToken cancellationToken) =>
+{
+    if (!string.IsNullOrWhiteSpace(exchange) && !IsSupportedExchange(exchange))
+    {
+        return Results.BadRequest("Unsupported exchange.");
+    }
+
+    var effectiveTo = to ?? DateTimeOffset.UtcNow;
+    var effectiveFrom = from ?? effectiveTo.AddHours(-24);
+
+    if (effectiveFrom > effectiveTo)
+    {
+        return Results.BadRequest("'from' must be earlier than or equal to 'to'.");
+    }
+
+    var exchanges = string.IsNullOrWhiteSpace(exchange)
+        ? SupportedExchanges
+        : [exchange];
+
+    bool Predicate(TradeRecord row)
+    {
+        return row.IsBlockTrade ||
+               !string.IsNullOrWhiteSpace(row.BlockTradeId) ||
+               !string.IsNullOrWhiteSpace(row.BlockRfqId) ||
+               !string.IsNullOrWhiteSpace(row.ComboTradeId) ||
+               !string.IsNullOrWhiteSpace(row.ComboId);
+    }
+
+    var trades = await store.QueryAcrossExchangesAsync<TradeRecord>(
+        exchanges,
+        DataSetNames.Trades,
+        effectiveFrom.UtcDateTime,
+        effectiveTo.UtcDateTime,
+        symbol: null,
+        Predicate,
+        cancellationToken);
+
+    var groups = BlockTradeHistoryBuilder.Build(trades, minGroupUsd ?? 0m);
+
+    if (totalQuantity is not null)
+    {
+        groups = groups.Where(x => x.TotalQuantity >= totalQuantity.Value).ToArray();
+    }
+
+    if (minGroupUsd is not null)
+    {
+        groups = groups.Where(x => x.TotalUsdNotional >= minGroupUsd.Value).ToArray();
+    }
+
+    return Results.Ok(groups);
+})
+.WithName("GetBlockTradeHistory")
+.WithSummary("Get grouped block trade history with legs.")
+.WithDescription("Returns persisted trade history grouped into structured block-trade groups with individual legs included.")
 .WithTags("History");
 
 app.MapGet("/history/tickers", async (
