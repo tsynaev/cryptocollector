@@ -11,7 +11,6 @@ using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Channels;
-using System.Globalization;
 
 namespace CryptoCollector.Exchange.Binance.Services;
 
@@ -182,7 +181,7 @@ public sealed class BinanceExchange(
 
             if (optionSymbols.Count > 0)
             {
-                optionsTradeStreamTask = RunOptionsTradeStreamsAsync(optionSymbols, writer, connectionClosedSignal, cancellationToken);
+                optionsTradeStreamTask = RunOptionsTradeStreamAsync(optionSymbols, writer, connectionClosedSignal, cancellationToken);
             }
 
             foreach (var subscription in subscriptions)
@@ -225,68 +224,15 @@ public sealed class BinanceExchange(
         }
     }
 
-    private async Task RunOptionsTradeStreamsAsync(
+    private async Task RunOptionsTradeStreamAsync(
         IReadOnlyDictionary<string, InstrumentDefinition> optionSymbols,
         ChannelWriter<ExchangeDataMessage> writer,
         TaskCompletionSource connectionClosedSignal,
         CancellationToken cancellationToken)
     {
-        var streamNames = optionSymbols.Keys
-            .Select(static x => $"{x.ToLowerInvariant()}@optionTrade")
-            .Distinct(StringComparer.Ordinal)
-            .ToArray();
-
-        if (streamNames.Length == 0)
-        {
-            return;
-        }
-
-        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        var streamGroups = streamNames
-            .Chunk(Math.Max(1, _options.OptionTradeStreamsPerConnection))
-            .Select(static chunk => chunk.ToArray())
-            .ToArray();
-
-        var shardTasks = streamGroups
-            .Select((group, index) => RunOptionsTradeStreamShardAsync(
-                shardName: $"options-{index + 1}",
-                streamNames: group,
-                optionSymbols,
-                writer,
-                linkedCts.Token))
-            .ToArray();
-
-        try
-        {
-            await Task.WhenAny(shardTasks);
-        }
-        finally
-        {
-            connectionClosedSignal.TrySetResult();
-            await linkedCts.CancelAsync();
-        }
-
-        try
-        {
-            await Task.WhenAll(shardTasks);
-        }
-        catch (OperationCanceledException) when (linkedCts.IsCancellationRequested)
-        {
-        }
-    }
-
-    private async Task RunOptionsTradeStreamShardAsync(
-        string shardName,
-        IReadOnlyList<string> streamNames,
-        IReadOnlyDictionary<string, InstrumentDefinition> optionSymbols,
-        ChannelWriter<ExchangeDataMessage> writer,
-        CancellationToken cancellationToken)
-    {
         using var socket = new ClientWebSocket();
-        var uri = new Uri($"{_options.OptionsWebSocketBaseUrl.TrimEnd('/')}/public/ws");
+        var uri = new Uri($"{_options.OptionsWebSocketBaseUrl.TrimEnd('/')}/public/ws/{_options.UnderlyingSymbol.ToLowerInvariant()}@optionTrade");
         await socket.ConnectAsync(uri, cancellationToken);
-
-        await SubscribeToOptionTradeStreamsAsync(socket, shardName, streamNames, cancellationToken);
 
         while (!cancellationToken.IsCancellationRequested)
         {
@@ -297,8 +243,7 @@ public sealed class BinanceExchange(
             }
             catch (WebSocketException exception)
             {
-                logger.LogWarning(exception, "Binance options websocket receive failed. Shard={Shard}, State={State}, CloseStatus={CloseStatus}, Description={Description}.",
-                    shardName,
+                logger.LogWarning(exception, "Binance options websocket receive failed. State={State}, CloseStatus={CloseStatus}, Description={Description}.",
                     socket.State,
                     socket.CloseStatus,
                     socket.CloseStatusDescription);
@@ -307,17 +252,11 @@ public sealed class BinanceExchange(
 
             if (message is null)
             {
-                logger.LogWarning("Binance options websocket closed. Shard={Shard}, State={State}, CloseStatus={CloseStatus}, Description={Description}.",
-                    shardName,
+                logger.LogWarning("Binance options websocket closed. State={State}, CloseStatus={CloseStatus}, Description={Description}.",
                     socket.State,
                     socket.CloseStatus,
                     socket.CloseStatusDescription);
                 break;
-            }
-
-            if (IsSubscriptionAck(message))
-            {
-                continue;
             }
 
             var trade = JsonSerializer.Deserialize<BinanceOptionTradeStreamMessage>(message, JsonOptions);
@@ -333,68 +272,8 @@ public sealed class BinanceExchange(
         {
             await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "shutdown", CancellationToken.None);
         }
-    }
 
-    private async Task SubscribeToOptionTradeStreamsAsync(
-        ClientWebSocket socket,
-        string shardName,
-        IReadOnlyList<string> streamNames,
-        CancellationToken cancellationToken)
-    {
-        var batchSize = Math.Max(1, _options.OptionTradeSubscribeBatchSize);
-        var streamChunks = streamNames.Chunk(batchSize).ToArray();
-
-        for (var index = 0; index < streamChunks.Length; index++)
-        {
-            var payload = new
-            {
-                method = "SUBSCRIBE",
-                @params = streamChunks[index],
-                id = index + 1
-            };
-
-            await SendRequestAsync(socket, payload, cancellationToken);
-
-            if (index < streamChunks.Length - 1)
-            {
-                await Task.Delay(_options.OptionTradeSubscribeMessageDelay, cancellationToken);
-            }
-        }
-
-        logger.LogInformation(
-            "Subscribed Binance options shard. Shard={Shard}, StreamCount={StreamCount}, BatchCount={BatchCount}.",
-            shardName,
-            streamNames.Count,
-            streamChunks.Length);
-    }
-
-    private static async Task SendRequestAsync(ClientWebSocket socket, object payload, CancellationToken cancellationToken)
-    {
-        var request = JsonSerializer.Serialize(payload);
-        await socket.SendAsync(Encoding.UTF8.GetBytes(request), WebSocketMessageType.Text, true, cancellationToken);
-    }
-
-    private static bool IsSubscriptionAck(string message)
-    {
-        using var document = JsonDocument.Parse(message);
-        var root = document.RootElement;
-
-        if (root.ValueKind != JsonValueKind.Object)
-        {
-            return false;
-        }
-
-        if (root.TryGetProperty("result", out _))
-        {
-            return true;
-        }
-
-        if (root.TryGetProperty("code", out var codeProperty) && codeProperty.ValueKind == JsonValueKind.Number)
-        {
-            return true;
-        }
-
-        return false;
+        connectionClosedSignal.TrySetResult();
     }
 
     private async Task<UpdateSubscription> SubscribeAsync(Task<CryptoExchange.Net.Objects.CallResult<UpdateSubscription>> task)

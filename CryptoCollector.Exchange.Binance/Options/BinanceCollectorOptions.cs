@@ -15,9 +15,6 @@ public sealed class BinanceCollectorOptions
     public int RecentTradesLimit { get; init; } = 1000;
     public int OptionBootstrapSymbolLimit { get; init; } = 50;
     public int FuturesSubscriptionChunkSize { get; init; } = 100;
-    public int OptionTradeStreamsPerConnection { get; init; } = 180;
-    public int OptionTradeSubscribeBatchSize { get; init; } = 50;
-    public TimeSpan OptionTradeSubscribeMessageDelay { get; init; } = TimeSpan.FromMilliseconds(150);
     public int WebSocketReceiveBufferSize { get; init; } = 1024 * 64;
 
     public string UnderlyingSymbol => $"{BaseAsset}{QuoteAsset}";
