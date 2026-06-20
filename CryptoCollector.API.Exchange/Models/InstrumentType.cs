@@ -1,5 +1,8 @@
+using System.Text.Json.Serialization;
+
 namespace CryptoCollector.API.Exchange.Models;
 
+[JsonConverter(typeof(JsonStringEnumConverter))]
 public enum InstrumentType
 {
     Unknown = 0,

@@ -1,3 +1,4 @@
+using CryptoCollector.API.Exchange.Models;
 using CryptoCollector.API.Exchange.Services;
 using CryptoCollector.Api.Models;
 using CryptoCollector.Api.Options;
@@ -59,6 +60,7 @@ builder.Services.AddSingleton<IHostedService>(sp => new ExchangeCollectorService
     sp.GetRequiredService<ILogger<ExchangeCollectorService>>()));
 
 var app = builder.Build();
+var SupportedExchanges = new[] { "binance", "bybit", "deribit" };
 
 app.UseSwagger();
 app.UseSwaggerUI();
@@ -73,16 +75,17 @@ app.MapGet("/health", () => Results.Ok(new
 .WithTags("System");
 
 app.MapGet("/history/trades", async (
-    string exchange,
+    string? exchange,
     DateTimeOffset? from,
     DateTimeOffset? to,
     string? symbol,
+    InstrumentType? instrumentType,
     bool? blockTradesOnly,
     decimal? quantity,
     DailyParquetStore store,
     CancellationToken cancellationToken) =>
 {
-    if (!IsSupportedExchange(exchange))
+    if (!string.IsNullOrWhiteSpace(exchange) && !IsSupportedExchange(exchange))
     {
         return Results.BadRequest("Unsupported exchange.");
     }
@@ -95,29 +98,44 @@ app.MapGet("/history/trades", async (
         return Results.BadRequest("'from' must be earlier than or equal to 'to'.");
     }
 
-    var rows = await store.QueryAsync<TradeRecord>(
-        exchange,
+    var exchanges = string.IsNullOrWhiteSpace(exchange)
+        ? SupportedExchanges
+        : [exchange];
+
+    bool Predicate(TradeRecord row)
+    {
+        if (instrumentType is not null && row.InstrumentType != instrumentType.Value)
+        {
+            return false;
+        }
+
+        if (blockTradesOnly == true && !row.IsBlockTrade)
+        {
+            return false;
+        }
+
+        if (quantity is not null && row.Quantity < quantity.Value)
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    var rows = await store.QueryAcrossExchangesAsync<TradeRecord>(
+        exchanges,
         DataSetNames.Trades,
         effectiveFrom.UtcDateTime,
         effectiveTo.UtcDateTime,
         symbol,
+        Predicate,
         cancellationToken);
-
-    if (blockTradesOnly == true)
-    {
-        rows = rows.Where(static x => x.IsBlockTrade).ToArray();
-    }
-
-    if (quantity is not null)
-    {
-        rows = rows.Where(x => x.Quantity >= quantity.Value).ToArray();
-    }
 
     return Results.Ok(rows);
 })
 .WithName("GetTradeHistory")
 .WithSummary("Get raw trade history.")
-.WithDescription("Returns persisted trade rows from local Parquet storage. Default period is the last 24 hours when 'from' and 'to' are omitted.")
+.WithDescription("Returns persisted trade rows from local Parquet storage. Default period is the last 24 hours when 'from' and 'to' are omitted. When 'exchange' is omitted, rows are returned across all supported exchanges.")
 .WithTags("History");
 
 app.MapGet("/history/tickers", async (
@@ -144,6 +162,7 @@ app.MapGet("/history/tickers", async (
         from.UtcDateTime,
         to.UtcDateTime,
         symbol,
+        predicate: null,
         cancellationToken);
 
     return Results.Ok(rows);
@@ -233,6 +252,7 @@ app.MapGet("/history/option-chain", async (
             effectiveFrom.UtcDateTime,
             effectiveTo.UtcDateTime,
             symbol,
+            predicate: null,
             cancellationToken);
 
         rows = rows.Where(Predicate).ToArray();
@@ -245,9 +265,7 @@ app.MapGet("/history/option-chain", async (
 .WithDescription("Returns one-minute option-chain snapshots. When both 'from' and 'to' are omitted, returns the latest available chain snapshot.")
 .WithTags("History");
 
-static bool IsSupportedExchange(string exchange) =>
-    exchange.Equals("binance", StringComparison.OrdinalIgnoreCase) ||
-    exchange.Equals("bybit", StringComparison.OrdinalIgnoreCase) ||
-    exchange.Equals("deribit", StringComparison.OrdinalIgnoreCase);
+bool IsSupportedExchange(string exchange) =>
+    SupportedExchanges.Contains(exchange, StringComparer.OrdinalIgnoreCase);
 
 app.Run();

@@ -67,6 +67,23 @@ public sealed class DailyParquetStore(IOptions<StorageOptions> options)
         DateTime fromUtc,
         DateTime toUtc,
         string? symbol,
+        CancellationToken cancellationToken) where T : class, ITimeSeriesRecord, new() =>
+        await QueryAsync<T>(
+            exchange,
+            dataSet,
+            fromUtc,
+            toUtc,
+            symbol,
+            predicate: null,
+            cancellationToken);
+
+    public async Task<IReadOnlyList<T>> QueryAsync<T>(
+        string exchange,
+        string dataSet,
+        DateTime fromUtc,
+        DateTime toUtc,
+        string? symbol,
+        Func<T, bool>? predicate,
         CancellationToken cancellationToken) where T : class, ITimeSeriesRecord, new()
     {
         var directory = Path.Combine(_dataRoot, exchange.ToLowerInvariant(), dataSet);
@@ -99,6 +116,11 @@ public sealed class DailyParquetStore(IOptions<StorageOptions> options)
                         continue;
                     }
 
+                    if (predicate is not null && !predicate(row))
+                    {
+                        continue;
+                    }
+
                     results.Add(row);
                 }
             }
@@ -107,7 +129,41 @@ public sealed class DailyParquetStore(IOptions<StorageOptions> options)
         }
 
         return results
-            .OrderBy(static x => x.Date)
+            .OrderByDescending(static x => x.Date)
+            .ThenBy(static x => x.Symbol, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    public async Task<IReadOnlyList<T>> QueryAcrossExchangesAsync<T>(
+        IReadOnlyCollection<string> exchanges,
+        string dataSet,
+        DateTime fromUtc,
+        DateTime toUtc,
+        string? symbol,
+        Func<T, bool>? predicate,
+        CancellationToken cancellationToken) where T : class, ITimeSeriesRecord, new()
+    {
+        if (exchanges.Count == 0)
+        {
+            return [];
+        }
+
+        var exchangeTasks = exchanges
+            .Select(exchange => QueryAsync<T>(
+                exchange,
+                dataSet,
+                fromUtc,
+                toUtc,
+                symbol,
+                predicate,
+                cancellationToken))
+            .ToArray();
+
+        var exchangeResults = await Task.WhenAll(exchangeTasks);
+        var results = exchangeResults.SelectMany(static x => x).ToArray();
+
+        return results
+            .OrderByDescending(static x => x.Date)
             .ThenBy(static x => x.Symbol, StringComparer.OrdinalIgnoreCase)
             .ToArray();
     }
