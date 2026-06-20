@@ -2,8 +2,10 @@ using CryptoCollector.API.Exchange.Services;
 using CryptoCollector.Api.Models;
 using CryptoCollector.Api.Options;
 using CryptoCollector.Api.Services;
+using CryptoCollector.Exchange.Binance.Services;
 using CryptoCollector.Exchange.Bybit.Services;
 using CryptoCollector.Exchange.Deribit.Services;
+using CryptoCollector.Exchange.Binance;
 using CryptoCollector.Exchange.Bybit;
 using CryptoCollector.Exchange.Deribit;
 
@@ -31,8 +33,16 @@ builder.Services.AddSingleton<MinuteAggregationService>();
 builder.Services.AddSingleton<IMarketDataSink, CompositeMarketDataSink>();
 builder.Services.AddSingleton<IFlushableMarketDataSink>(sp => (CompositeMarketDataSink)sp.GetRequiredService<IMarketDataSink>());
 builder.Services.AddHostedService(sp => sp.GetRequiredService<MinuteAggregationService>());
+builder.Services.AddBinanceExchange(builder.Configuration);
 builder.Services.AddBybitExchange(builder.Configuration);
 builder.Services.AddDeribitExchange(builder.Configuration);
+builder.Services.AddSingleton<IHostedService>(sp => new ExchangeCollectorService(
+    sp.GetRequiredService<BinanceExchange>(),
+    sp.GetRequiredService<DailyParquetStore>(),
+    sp.GetRequiredService<IMarketDataSink>(),
+    sp.GetRequiredService<IFlushableMarketDataSink>(),
+    sp.GetRequiredService<BlockTradeAlertService>(),
+    sp.GetRequiredService<ILogger<ExchangeCollectorService>>()));
 builder.Services.AddSingleton<IHostedService>(sp => new ExchangeCollectorService(
     sp.GetRequiredService<BybitExchange>(),
     sp.GetRequiredService<DailyParquetStore>(),
@@ -236,6 +246,7 @@ app.MapGet("/history/option-chain", async (
 .WithTags("History");
 
 static bool IsSupportedExchange(string exchange) =>
+    exchange.Equals("binance", StringComparison.OrdinalIgnoreCase) ||
     exchange.Equals("bybit", StringComparison.OrdinalIgnoreCase) ||
     exchange.Equals("deribit", StringComparison.OrdinalIgnoreCase);
 

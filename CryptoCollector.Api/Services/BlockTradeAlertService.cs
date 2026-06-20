@@ -22,7 +22,7 @@ public sealed class BlockTradeAlertService(
     private const string StateKey = "block-trade-alert";
     private const int TelegramCaptionLimit = 1024;
     private static readonly TimeSpan PersistInterval = TimeSpan.FromSeconds(30);
-    private static readonly string[] Exchanges = ["bybit", "deribit"];
+    private static readonly string[] Exchanges = ["binance", "bybit", "deribit"];
 
     private readonly BlockTradesAlertOptions _options = options.Value;
     private readonly ConcurrentDictionary<string, BlockTradeGroup> _groups = new(StringComparer.OrdinalIgnoreCase);

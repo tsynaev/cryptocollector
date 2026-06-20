@@ -16,6 +16,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\CryptoCollector.API.Exchange\CryptoCollector.API.Exchange.csproj" />
+    <ProjectReference Include="..\CryptoCollector.Exchange.Binance\CryptoCollector.Exchange.Binance.csproj" />
     <ProjectReference Include="..\CryptoCollector.Exchange.Bybit\CryptoCollector.Exchange.Bybit.csproj" />
     <ProjectReference Include="..\CryptoCollector.Exchange.Deribit\CryptoCollector.Exchange.Deribit.csproj" />
   </ItemGroup>

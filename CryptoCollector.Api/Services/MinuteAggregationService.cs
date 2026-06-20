@@ -146,7 +146,7 @@ public sealed class MinuteAggregationService(
             return;
         }
 
-        foreach (var exchange in new[] { "bybit", "deribit" })
+        foreach (var exchange in new[] { "binance", "bybit", "deribit" })
         {
             var latestTimestamp = await store.GetLatestTimestampAsync<TradeRecord>(exchange, DataSetNames.Trades, cancellationToken);
             if (latestTimestamp is null)
@@ -332,6 +332,12 @@ public sealed class MinuteAggregationService(
         var pendingTickerCounts = CountByExchange(_tickerBars.Values);
         var pendingOptionCounts = CountByExchange(_optionBars.Values);
         var seenTradeCounts = CountSeenTradeIdsByExchange();
+        var tradeTypeCounts = CountByExchangeAndInstrumentType(tradeRows);
+        var tickerTypeCounts = CountByExchangeAndInstrumentType(tickerRows);
+        var optionTypeCounts = CountByExchangeAndInstrumentType(optionRows);
+        var pendingTradeTypeCounts = CountByExchangeAndInstrumentType(_tradeRows.Values);
+        var pendingTickerTypeCounts = CountByExchangeAndInstrumentType(_tickerBars.Values);
+        var pendingOptionTypeCounts = CountByExchangeAndInstrumentType(_optionBars.Values);
 
         var exchanges = tradeCounts.Keys
             .Concat(tickerCounts.Keys)
@@ -348,6 +354,12 @@ public sealed class MinuteAggregationService(
         {
             Console.WriteLine(
                 $"[{DateTimeOffset.UtcNow:O}] exchange={exchange} minute={reportedMinute:yyyy-MM-dd HH:mm}Z trades={tradeCounts.GetValueOrDefault(exchange)} tickers={tickerCounts.GetValueOrDefault(exchange)} optionChain={optionCounts.GetValueOrDefault(exchange)} pendingTrades={pendingTradeCounts.GetValueOrDefault(exchange)} pendingTickers={pendingTickerCounts.GetValueOrDefault(exchange)} pendingOptionChain={pendingOptionCounts.GetValueOrDefault(exchange)} seenTradeIds={seenTradeCounts.GetValueOrDefault(exchange)}");
+            WriteInstrumentTypeBreakdown(exchange, "trades", tradeTypeCounts);
+            WriteInstrumentTypeBreakdown(exchange, "tickers", tickerTypeCounts);
+            WriteInstrumentTypeBreakdown(exchange, "optionChain", optionTypeCounts);
+            WriteInstrumentTypeBreakdown(exchange, "pendingTrades", pendingTradeTypeCounts);
+            WriteInstrumentTypeBreakdown(exchange, "pendingTickers", pendingTickerTypeCounts);
+            WriteInstrumentTypeBreakdown(exchange, "pendingOptionChain", pendingOptionTypeCounts);
         }
     }
 
@@ -396,12 +408,60 @@ public sealed class MinuteAggregationService(
         return counts;
     }
 
+    private static Dictionary<ExchangeInstrumentTypeKey, int> CountByExchangeAndInstrumentType<T>(IEnumerable<T> rows) where T : class
+    {
+        var counts = new Dictionary<ExchangeInstrumentTypeKey, int>();
+
+        foreach (var row in rows)
+        {
+            var key = row switch
+            {
+                TradeRecord tradeRecord => new ExchangeInstrumentTypeKey(tradeRecord.Exchange, tradeRecord.InstrumentType),
+                TickerMinuteBar tickerMinuteBar => new ExchangeInstrumentTypeKey(tickerMinuteBar.Exchange, tickerMinuteBar.InstrumentType),
+                OptionChainMinuteBar optionChainMinuteBar => new ExchangeInstrumentTypeKey(optionChainMinuteBar.Exchange, optionChainMinuteBar.InstrumentType),
+                MinuteAccumulatorBase accumulator => new ExchangeInstrumentTypeKey(accumulator.Exchange, accumulator.InstrumentType),
+                _ => default
+            };
+
+            if (string.IsNullOrWhiteSpace(key.Exchange))
+            {
+                continue;
+            }
+
+            counts.TryGetValue(key, out var count);
+            counts[key] = count + 1;
+        }
+
+        return counts;
+    }
+
+    private static void WriteInstrumentTypeBreakdown(
+        string exchange,
+        string metricName,
+        IReadOnlyDictionary<ExchangeInstrumentTypeKey, int> counts)
+    {
+        var typedCounts = counts
+            .Where(x => x.Key.Exchange.Equals(exchange, StringComparison.OrdinalIgnoreCase))
+            .OrderBy(x => x.Key.InstrumentType)
+            .ToArray();
+
+        if (typedCounts.Length == 0)
+        {
+            return;
+        }
+
+        var breakdown = string.Join(", ", typedCounts.Select(x => $"{x.Key.InstrumentType}={x.Value}"));
+        Console.WriteLine($"[{DateTimeOffset.UtcNow:O}] exchange={exchange} {metricName} ({breakdown})");
+    }
+
     private sealed record SeenTradeMarker(string Key, DateTime TimestampUtc);
+    private readonly record struct ExchangeInstrumentTypeKey(string Exchange, InstrumentType InstrumentType);
 
     private abstract class MinuteAccumulatorBase(InstrumentDefinition instrument, DateTime minute)
     {
         protected InstrumentDefinition Instrument { get; } = instrument;
         public string Exchange => Instrument.Exchange;
+        public InstrumentType InstrumentType => Instrument.InstrumentType;
         public DateTime Minute { get; } = minute;
     }
 

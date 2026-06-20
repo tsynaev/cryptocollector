@@ -3,6 +3,7 @@ WORKDIR /src
 
 COPY ["CryptoCollector.Api/CryptoCollector.Api.csproj", "CryptoCollector.Api/"]
 COPY ["CryptoCollector.API.Exchange/CryptoCollector.API.Exchange.csproj", "CryptoCollector.API.Exchange/"]
+COPY ["CryptoCollector.Exchange.Binance/CryptoCollector.Exchange.Binance.csproj", "CryptoCollector.Exchange.Binance/"]
 COPY ["CryptoCollector.Exchange.Bybit/CryptoCollector.Exchange.Bybit.csproj", "CryptoCollector.Exchange.Bybit/"]
 COPY ["CryptoCollector.Exchange.Deribit/CryptoCollector.Exchange.Deribit.csproj", "CryptoCollector.Exchange.Deribit/"]
 RUN dotnet restore "CryptoCollector.Api/CryptoCollector.Api.csproj"
