@@ -155,7 +155,15 @@ public sealed class LegacyTradeRecordV2 : ITimeSeriesRecord
         {
             Exchange = Exchange,
             Symbol = Symbol,
-            InstrumentType = TradeRecordInstrumentTypeResolver.ResolveInstrumentType(MarketType, BaseAsset, QuoteAsset, SettleAsset),
+            InstrumentType = TradeRecordInstrumentTypeResolver.ResolveInstrumentType(
+                Symbol,
+                MarketType,
+                BaseAsset,
+                QuoteAsset,
+                SettleAsset,
+                ExpiryUtc,
+                strikePrice: null,
+                optionSide: null),
             BaseAsset = BaseAsset,
             QuoteAsset = QuoteAsset,
             SettleAsset = SettleAsset,
@@ -213,7 +221,15 @@ public sealed class LegacyTradeRecordV1 : ITimeSeriesRecord
         {
             Exchange = Exchange,
             Symbol = Symbol,
-            InstrumentType = TradeRecordInstrumentTypeResolver.ResolveInstrumentType(MarketType, BaseAsset, QuoteAsset, SettleAsset),
+            InstrumentType = TradeRecordInstrumentTypeResolver.ResolveInstrumentType(
+                Symbol,
+                MarketType,
+                BaseAsset,
+                QuoteAsset,
+                SettleAsset,
+                ExpiryUtc,
+                strikePrice: null,
+                optionSide: null),
             BaseAsset = BaseAsset,
             QuoteAsset = QuoteAsset,
             SettleAsset = SettleAsset,
@@ -295,7 +311,15 @@ public sealed class LegacyTickerMinuteBarV1 : ITimeSeriesRecord
         {
             Exchange = Exchange,
             Symbol = Symbol,
-            InstrumentType = TradeRecordInstrumentTypeResolver.ResolveInstrumentType(MarketType, BaseAsset, QuoteAsset, SettleAsset),
+            InstrumentType = TradeRecordInstrumentTypeResolver.ResolveInstrumentType(
+                Symbol,
+                MarketType,
+                BaseAsset,
+                QuoteAsset,
+                SettleAsset,
+                ExpiryUtc,
+                strikePrice: null,
+                optionSide: null),
             BaseAsset = BaseAsset,
             QuoteAsset = QuoteAsset,
             SettleAsset = SettleAsset,
@@ -397,7 +421,15 @@ public sealed class LegacyOptionChainMinuteBarV1 : ITimeSeriesRecord
         {
             Exchange = Exchange,
             Symbol = Symbol,
-            InstrumentType = TradeRecordInstrumentTypeResolver.ResolveInstrumentType(MarketType, BaseAsset, QuoteAsset, SettleAsset),
+            InstrumentType = TradeRecordInstrumentTypeResolver.ResolveInstrumentType(
+                Symbol,
+                MarketType,
+                BaseAsset,
+                QuoteAsset,
+                SettleAsset,
+                ExpiryUtc,
+                StrikePrice,
+                OptionSide),
             BaseAsset = BaseAsset,
             QuoteAsset = QuoteAsset,
             SettleAsset = SettleAsset,
@@ -432,18 +464,82 @@ public sealed class LegacyOptionChainMinuteBarV1 : ITimeSeriesRecord
 
 internal static class TradeRecordInstrumentTypeResolver
 {
-    public static InstrumentType ResolveInstrumentType(string? marketType, string baseAsset, string quoteAsset, string settleAsset) =>
-        marketType?.ToLowerInvariant() switch
+    public static InstrumentType ResolveInstrumentType(
+        string? symbol,
+        string? marketType,
+        string baseAsset,
+        string quoteAsset,
+        string settleAsset,
+        DateTime? expiryUtc,
+        decimal? strikePrice,
+        string? optionSide)
+    {
+        var normalizedMarketType = marketType?.ToLowerInvariant();
+        if (normalizedMarketType == "option")
         {
-            "option" => InstrumentType.Option,
-            "perpetual" => ResolveDerivativeInstrumentType(true, baseAsset, quoteAsset, settleAsset),
-            "future" => ResolveDerivativeInstrumentType(false, baseAsset, quoteAsset, settleAsset),
-            "futures" => ResolveDerivativeInstrumentType(false, baseAsset, quoteAsset, settleAsset),
-            "spot" => InstrumentType.Spot,
-            "margin" => InstrumentType.Margin,
-            "cash" => InstrumentType.Cash,
-            _ => InstrumentType.Unknown
-        };
+            return InstrumentType.Option;
+        }
+
+        if (!string.IsNullOrWhiteSpace(optionSide) || strikePrice is not null)
+        {
+            return InstrumentType.Option;
+        }
+
+        if (normalizedMarketType is "perpetual")
+        {
+            return ResolveDerivativeInstrumentType(true, baseAsset, quoteAsset, settleAsset);
+        }
+
+        if (normalizedMarketType is "future" or "futures")
+        {
+            return ResolveDerivativeInstrumentType(false, baseAsset, quoteAsset, settleAsset);
+        }
+
+        if (normalizedMarketType == "spot")
+        {
+            return InstrumentType.Spot;
+        }
+
+        if (normalizedMarketType == "margin")
+        {
+            return InstrumentType.Margin;
+        }
+
+        if (normalizedMarketType == "cash")
+        {
+            return InstrumentType.Cash;
+        }
+
+        if (!string.IsNullOrWhiteSpace(symbol))
+        {
+            if (symbol.Contains("PERPETUAL", StringComparison.OrdinalIgnoreCase) ||
+                symbol.Contains("PERP", StringComparison.OrdinalIgnoreCase))
+            {
+                return ResolveDerivativeInstrumentType(true, baseAsset, quoteAsset, settleAsset);
+            }
+
+            if (symbol.Contains("-C", StringComparison.OrdinalIgnoreCase) ||
+                symbol.Contains("-P", StringComparison.OrdinalIgnoreCase))
+            {
+                return InstrumentType.Option;
+            }
+        }
+
+        if (expiryUtc is not null)
+        {
+            return ResolveDerivativeInstrumentType(false, baseAsset, quoteAsset, settleAsset);
+        }
+
+        if (settleAsset.Equals(baseAsset, StringComparison.OrdinalIgnoreCase) ||
+            quoteAsset.Equals("USD", StringComparison.OrdinalIgnoreCase) ||
+            quoteAsset.Equals("USDT", StringComparison.OrdinalIgnoreCase) ||
+            quoteAsset.Equals("USDC", StringComparison.OrdinalIgnoreCase))
+        {
+            return InstrumentType.Spot;
+        }
+
+        return InstrumentType.Unknown;
+    }
 
     private static InstrumentType ResolveDerivativeInstrumentType(bool isPerpetual, string baseAsset, string quoteAsset, string settleAsset)
     {
