@@ -42,11 +42,14 @@ public sealed class PositionPnlChartRenderer
         using var spotPaint = new SKPaint { Color = new SKColor(50, 100, 200), StrokeWidth = 2, IsAntialias = true, PathEffect = SKPathEffect.CreateDash([8, 8], 0) };
         using var expiryLinePaint = new SKPaint { Color = new SKColor(0, 120, 90), StrokeWidth = 4, IsAntialias = true, Style = SKPaintStyle.Stroke };
         using var currentLinePaint = new SKPaint { Color = new SKColor(214, 110, 0), StrokeWidth = 4, IsAntialias = true, Style = SKPaintStyle.Stroke };
-        using var textPaint = new SKPaint { Color = SKColors.Black, TextSize = 20, IsAntialias = true };
-        using var titlePaint = new SKPaint { Color = SKColors.Black, TextSize = 28, IsAntialias = true, FakeBoldText = true };
-        using var smallTextPaint = new SKPaint { Color = new SKColor(70, 70, 70), TextSize = 18, IsAntialias = true };
+        using var textPaint = new SKPaint { Color = SKColors.Black, IsAntialias = true };
+        using var titlePaint = new SKPaint { Color = SKColors.Black, IsAntialias = true };
+        using var smallTextPaint = new SKPaint { Color = new SKColor(70, 70, 70), IsAntialias = true };
+        using var textFont = new SKFont { Size = 20 };
+        using var titleFont = new SKFont { Size = 28, Embolden = true };
+        using var smallTextFont = new SKFont { Size = 18 };
 
-        DrawGrid(canvas, textPaint, gridPaint, xMin, xMax, yMin, yMax, left, top, width, height, MapX, MapY);
+        DrawGrid(canvas, textPaint, textFont, gridPaint, xMin, xMax, yMin, yMax, left, top, width, height, MapX, MapY);
         canvas.DrawLine(left, top + height, left + width, top + height, axisPaint);
         canvas.DrawLine(left, top, left, top + height, axisPaint);
         canvas.DrawLine(left, MapY(0), left + width, MapY(0), zeroPaint);
@@ -73,10 +76,10 @@ public sealed class PositionPnlChartRenderer
             canvas.DrawPath(currentPath, currentLinePaint);
         }
 
-        canvas.DrawText($"Expiry Payoff ({chart.DisplayCurrency})", left, 30, titlePaint);
-        canvas.DrawText($"Current spot: {chart.CurrentSpot:0.##}", left + width - 230, 30, textPaint);
-        canvas.DrawText($"As of: {chart.AsOfUtc:dd MMM yyyy HH:mm:ss} UTC", left, top + height + 62, smallTextPaint);
-        DrawLegend(canvas, left + width - 270, top + 14, expiryLinePaint, currentLinePaint, spotPaint, smallTextPaint);
+        canvas.DrawText($"Expiry Payoff ({chart.DisplayCurrency})", left, 30, SKTextAlign.Left, titleFont, titlePaint);
+        canvas.DrawText($"Current spot: {chart.CurrentSpot:0.##}", left + width - 230, 30, SKTextAlign.Left, textFont, textPaint);
+        canvas.DrawText($"As of: {chart.AsOfUtc:dd MMM yyyy HH:mm:ss} UTC", left, top + height + 62, SKTextAlign.Left, smallTextFont, smallTextPaint);
+        DrawLegend(canvas, left + width - 270, top + 14, expiryLinePaint, currentLinePaint, spotPaint, smallTextPaint, smallTextFont);
 
         using var image = surface.Snapshot();
         using var data = image.Encode(SKEncodedImageFormat.Png, 100);
@@ -86,6 +89,7 @@ public sealed class PositionPnlChartRenderer
     private static void DrawGrid(
         SKCanvas canvas,
         SKPaint textPaint,
+        SKFont textFont,
         SKPaint gridPaint,
         decimal xMin,
         decimal xMax,
@@ -103,12 +107,12 @@ public sealed class PositionPnlChartRenderer
             var xValue = xMin + (xMax - xMin) * tick / 5m;
             var x = mapX(xValue);
             canvas.DrawLine(x, top, x, top + height, gridPaint);
-            canvas.DrawText($"{xValue:0}", x - 25, top + height + 30, textPaint);
+            canvas.DrawText($"{xValue:0}", x - 25, top + height + 30, SKTextAlign.Left, textFont, textPaint);
 
             var yValue = yMin + (yMax - yMin) * tick / 5m;
             var y = mapY(yValue);
             canvas.DrawLine(left, y, left + width, y, gridPaint);
-            canvas.DrawText(FormatCompact(yValue), 10, y + 7, textPaint);
+            canvas.DrawText(FormatCompact(yValue), 10, y + 7, SKTextAlign.Left, textFont, textPaint);
         }
     }
 
@@ -130,7 +134,8 @@ public sealed class PositionPnlChartRenderer
         SKPaint expiryLinePaint,
         SKPaint currentLinePaint,
         SKPaint spotPaint,
-        SKPaint textPaint)
+        SKPaint textPaint,
+        SKFont textFont)
     {
         DrawLegendItem(canvas, x, y, expiryLinePaint, "Expiry");
         DrawLegendItem(canvas, x, y + 24, currentLinePaint, "Current");
@@ -139,7 +144,7 @@ public sealed class PositionPnlChartRenderer
         void DrawLegendItem(SKCanvas targetCanvas, float itemX, float itemY, SKPaint paint, string label)
         {
             targetCanvas.DrawLine(itemX, itemY, itemX + 32, itemY, paint);
-            targetCanvas.DrawText(label, itemX + 42, itemY + 6, textPaint);
+            targetCanvas.DrawText(label, itemX + 42, itemY + 6, SKTextAlign.Left, textFont, textPaint);
         }
     }
 }
