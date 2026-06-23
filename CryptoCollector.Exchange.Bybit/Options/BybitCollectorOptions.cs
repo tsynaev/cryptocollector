@@ -11,7 +11,6 @@ public sealed class BybitCollectorOptions
     public TimeSpan HeartbeatInterval { get; init; } = TimeSpan.FromSeconds(20);
     public int OptionTickerChunkSize { get; init; } = 250;
     public int LinearChunkSize { get; init; } = 100;
-    public decimal MinTradeQuantity { get; init; } = 0m;
     public int RestRetryCount { get; init; } = 5;
     public TimeSpan RestRetryDelay { get; init; } = TimeSpan.FromSeconds(3);
 }

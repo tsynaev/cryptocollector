@@ -10,37 +10,51 @@ using Microsoft.Extensions.Options;
 
 namespace CryptoCollector.Api.Services;
 
-public sealed class BlockTradeAlertService(
-    DailyParquetStore store,
-    ServiceStateStore stateStore,
-    IOptions<BlockTradesAlertOptions> options,
-    IMessageQueue messageQueue,
-    PositionPnlChartRenderer chartRenderer,
-    BlackScholesPricer blackScholesPricer,
-    ILogger<BlockTradeAlertService> logger) : BackgroundService
+public sealed class BlockTradeAlertService : BackgroundService
 {
     private const string StateKey = "block-trade-alert";
     private const int TelegramCaptionLimit = 1024;
     private static readonly TimeSpan PersistInterval = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan ReplayLookbackWindow = TimeSpan.FromMinutes(30);
     private static readonly string[] Exchanges = ["binance", "bybit", "deribit"];
 
-    private readonly BlockTradesAlertOptions _options = options.Value;
+    private readonly DailyParquetStore store;
+    private readonly ServiceStateStore stateStore;
+    private readonly IMessageQueue messageQueue;
+    private readonly PositionPnlChartRenderer chartRenderer;
+    private readonly BlackScholesPricer blackScholesPricer;
+    private readonly ILogger<BlockTradeAlertService> logger;
+    private readonly BlockTradesAlertOptions _options;
     private readonly ConcurrentDictionary<string, BlockTradeGroup> _groups = new(StringComparer.OrdinalIgnoreCase);
-    private readonly ConcurrentQueue<PendingTrade> _pendingTrades = new();
+    private readonly ConcurrentQueue<EnrichedBlockTradeRecord> _pendingCandidates = new();
+    private readonly IDisposable _candidateSubscription;
     private readonly Lock _stateGate = new();
     private BlockTradeAlertState _state = new();
     private volatile bool _stateDirty;
-    private volatile bool _startupReplayCompleted;
     private DateTime _lastStatePersistedUtc = DateTime.MinValue;
 
-    public void IngestRecoveredTrade(InstrumentDefinition instrument, ExchangeTrade trade)
+    public BlockTradeAlertService(
+        DailyParquetStore store,
+        ServiceStateStore stateStore,
+        IOptions<BlockTradesAlertOptions> options,
+        ILocalMessageBus localMessageBus,
+        IMessageQueue messageQueue,
+        PositionPnlChartRenderer chartRenderer,
+        BlackScholesPricer blackScholesPricer,
+        ILogger<BlockTradeAlertService> logger)
     {
-        IngestInternal(instrument, trade, updateCursor: true);
-    }
-
-    public void IngestLiveTrade(InstrumentDefinition instrument, ExchangeTrade trade)
-    {
-        IngestInternal(instrument, trade, updateCursor: true);
+        this.store = store;
+        this.stateStore = stateStore;
+        this.messageQueue = messageQueue;
+        this.chartRenderer = chartRenderer;
+        this.blackScholesPricer = blackScholesPricer;
+        this.logger = logger;
+        _options = options.Value;
+        _candidateSubscription = localMessageBus.Subscribe<EnrichedBlockTradeRecord>(candidate =>
+        {
+            _pendingCandidates.Enqueue(candidate);
+            return Task.CompletedTask;
+        });
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -50,8 +64,7 @@ public sealed class BlockTradeAlertService(
 
         await InitializeStateAsync(exchangesToReplay, stoppingToken);
         await ReplayStoredBlockTradesAsync(exchangesToReplay, stoppingToken);
-        DrainPendingTrades();
-        _startupReplayCompleted = true;
+        DrainPendingCandidates();
 
         using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(500));
 
@@ -73,6 +86,7 @@ public sealed class BlockTradeAlertService(
 
     public override async Task StopAsync(CancellationToken cancellationToken)
     {
+        _candidateSubscription.Dispose();
         await FlushReadyGroupsAsync(cancellationToken, force: true);
         await PersistStateAsync(cancellationToken, force: true);
         await base.StopAsync(cancellationToken);
@@ -117,16 +131,17 @@ public sealed class BlockTradeAlertService(
                 continue;
             }
 
-            var latestTradeTimestampUtc = await store.GetLatestTimestampAsync<TradeRecord>(exchange, DataSetNames.Trades, cancellationToken);
+            var latestTradeTimestampUtc = await store.GetLatestTimestampAsync<EnrichedBlockTradeRecord>(exchange, DataSetNames.BlockTrades, cancellationToken);
             if (latestTradeTimestampUtc is null || latestTradeTimestampUtc.Value < cursor.LastCheckedTradeUtc)
             {
                 continue;
             }
 
-            var trades = await store.QueryAsync<TradeRecord>(
+            var replayFromUtc = cursor.LastCheckedTradeUtc - ReplayLookbackWindow;
+            var trades = await store.QueryAsync<EnrichedBlockTradeRecord>(
                 exchange,
-                DataSetNames.Trades,
-                cursor.LastCheckedTradeUtc.Date,
+                DataSetNames.BlockTrades,
+                replayFromUtc,
                 latestTradeTimestampUtc.Value,
                 symbol: null,
                 cancellationToken);
@@ -147,100 +162,17 @@ public sealed class BlockTradeAlertService(
         }
     }
 
-    private void IngestInternal(InstrumentDefinition instrument, ExchangeTrade trade, bool updateCursor)
+    private void IngestCore(EnrichedBlockTradeRecord trade, bool updateCursor)
     {
-        if (!_startupReplayCompleted)
-        {
-            _pendingTrades.Enqueue(new PendingTrade(instrument, trade, updateCursor));
-            return;
-        }
+        var timestamp = trade.Date;
+        var tradeKey = BuildTradeKey(trade.Exchange, trade.Symbol, trade.TradeId, timestamp);
 
-        IngestCore(instrument, trade, updateCursor);
-    }
-
-    private void IngestCore(InstrumentDefinition instrument, ExchangeTrade trade, bool updateCursor)
-    {
-        var timestamp = trade.TradeTime.UtcDateTime;
-        var tradeKey = BuildTradeKey(instrument.Exchange, instrument.Symbol, trade.TradeId, timestamp);
-
-        if (updateCursor && !ShouldProcessTrade(instrument.Exchange, timestamp, tradeKey))
+        if (updateCursor && !ShouldProcessTrade(trade.Exchange, timestamp, tradeKey))
         {
             return;
         }
 
-        if (!_options.Enabled || !TryResolveAlertGroupKey(instrument, trade, out var groupKey, out var groupId, out var groupType))
-        {
-            return;
-        }
-
-        var price = trade.Price;
-        var quantity = trade.Quantity;
-
-        var leg = new BlockTradeLeg(
-            instrument.Exchange,
-            instrument.Symbol,
-            instrument.InstrumentType,
-            instrument.BaseAsset,
-            instrument.QuoteAsset,
-            instrument.SettleAsset,
-            instrument.ExpiryUtc,
-            instrument.StrikePrice,
-            instrument.OptionSide,
-            trade.Side,
-            quantity,
-            trade.Contracts,
-            trade.Amount,
-            price,
-            trade.MarkPrice,
-            trade.IndexPrice,
-            trade.Iv,
-            trade.MarkIv,
-            price * quantity,
-            groupId,
-            groupType,
-            timestamp);
-
-        _groups.AddOrUpdate(
-            $"{instrument.Exchange}|{groupKey}",
-            _ => new BlockTradeGroup(leg, _options.GroupWindow),
-            (_, existing) =>
-            {
-                existing.Add(leg, _options.GroupWindow);
-                return existing;
-            });
-    }
-
-    private void DrainPendingTrades()
-    {
-        if (_pendingTrades.IsEmpty)
-        {
-            return;
-        }
-
-        var bufferedTrades = new List<PendingTrade>();
-        while (_pendingTrades.TryDequeue(out var pendingTrade))
-        {
-            bufferedTrades.Add(pendingTrade);
-        }
-
-        foreach (var pendingTrade in bufferedTrades
-                     .OrderBy(static x => x.Trade.TradeTime.UtcDateTime)
-                     .ThenBy(static x => x.Instrument.Symbol, StringComparer.OrdinalIgnoreCase)
-                     .ThenBy(static x => x.Trade.TradeId, StringComparer.Ordinal))
-        {
-            IngestCore(pendingTrade.Instrument, pendingTrade.Trade, pendingTrade.UpdateCursor);
-        }
-    }
-
-    private void IngestStoredTrade(TradeRecord trade)
-    {
-        var tradeKey = BuildTradeKey(trade.Exchange, trade.Symbol, trade.TradeId, trade.Date);
-        if (!ShouldProcessTrade(trade.Exchange, trade.Date, tradeKey))
-        {
-            return;
-        }
-
-        if (!_options.Enabled || !TryResolveAlertGroupKey(trade, out var groupKey, out var groupId, out var groupType))
+        if (!_options.Enabled || string.IsNullOrWhiteSpace(trade.GroupId) || string.IsNullOrWhiteSpace(trade.GroupType))
         {
             return;
         }
@@ -265,12 +197,85 @@ public sealed class BlockTradeAlertService(
             trade.Iv,
             trade.MarkIv,
             trade.Notional,
-            groupId,
-            groupType,
+            trade.GroupId,
+            trade.GroupType,
+            trade.PreTradeOpenInterest,
+            trade.PostTradeOpenInterest,
+            timestamp);
+
+        _groups.AddOrUpdate(
+            $"{trade.Exchange}|{trade.GroupType}|{trade.GroupId}",
+            _ => new BlockTradeGroup(leg, _options.GroupWindow),
+            (_, existing) =>
+            {
+                existing.Add(leg, _options.GroupWindow);
+                return existing;
+            });
+    }
+
+    private void DrainPendingCandidates()
+    {
+        if (_pendingCandidates.IsEmpty)
+        {
+            return;
+        }
+
+        var bufferedTrades = new List<EnrichedBlockTradeRecord>();
+        while (_pendingCandidates.TryDequeue(out var pendingTrade))
+        {
+            bufferedTrades.Add(pendingTrade);
+        }
+
+        foreach (var pendingTrade in bufferedTrades
+                     .OrderBy(static x => x.Date)
+                     .ThenBy(static x => x.Symbol, StringComparer.OrdinalIgnoreCase)
+                     .ThenBy(static x => x.TradeId, StringComparer.Ordinal))
+        {
+            IngestCore(pendingTrade, updateCursor: true);
+        }
+    }
+
+    private void IngestStoredTrade(EnrichedBlockTradeRecord trade)
+    {
+        var tradeKey = BuildTradeKey(trade.Exchange, trade.Symbol, trade.TradeId, trade.Date);
+        if (!ShouldProcessTrade(trade.Exchange, trade.Date, tradeKey))
+        {
+            return;
+        }
+
+        if (!_options.Enabled || string.IsNullOrWhiteSpace(trade.GroupId) || string.IsNullOrWhiteSpace(trade.GroupType))
+        {
+            return;
+        }
+
+        var leg = new BlockTradeLeg(
+            trade.Exchange,
+            trade.Symbol,
+            trade.InstrumentType,
+            trade.BaseAsset,
+            trade.QuoteAsset,
+            trade.SettleAsset,
+            trade.ExpiryUtc,
+            trade.StrikePrice,
+            trade.OptionSide,
+            trade.Side,
+            trade.Quantity,
+            trade.Contracts,
+            trade.Amount,
+            trade.Price,
+            trade.MarkPrice,
+            trade.IndexPrice,
+            trade.Iv,
+            trade.MarkIv,
+            trade.Notional,
+            trade.GroupId,
+            trade.GroupType,
+            trade.PreTradeOpenInterest,
+            trade.PostTradeOpenInterest,
             trade.Date);
 
         _groups.AddOrUpdate(
-            $"{trade.Exchange}|{groupKey}",
+            $"{trade.Exchange}|{trade.GroupType}|{trade.GroupId}",
             _ => new BlockTradeGroup(leg, _options.GroupWindow),
             (_, existing) =>
             {
@@ -425,13 +430,14 @@ public sealed class BlockTradeAlertService(
         var headerSuffix = string.IsNullOrWhiteSpace(baseAsset)
             ? string.Empty
             : $" ({encoder.Encode(baseAsset.ToUpperInvariant())})";
+        var title = ResolveAlertTitle(group);
 
         return string.Join('\n',
         [
-            $"<b>BLOCK TRADE {encoder.Encode(group.Exchange.ToUpperInvariant())}{headerSuffix}</b>",
-            $"{timestamp:dd MMMM yyyy HH:mm:ss} UTC",
+            $"<b>{title} {encoder.Encode(group.Exchange.ToUpperInvariant())}{headerSuffix}</b>",
             string.Empty,
             .. legLines,
+            $"{timestamp:dd MMMM yyyy HH:mm:ss} UTC",
             $"<code>{encoder.Encode(group.GroupId)}</code>"
         ]);
     }
@@ -476,7 +482,37 @@ public sealed class BlockTradeAlertService(
                 lines.Add(string.Empty);
             }
 
-            foreach (var leg in nonOptionLegs)
+            var expiringFutureGroups = nonOptionLegs
+                .Where(IsExpiringFutureLeg)
+                .GroupBy(static x => x.ExpiryUtc)
+                .OrderBy(static x => x.Key ?? DateTime.MaxValue)
+                .ToArray();
+
+            foreach (var expiryGroup in expiringFutureGroups)
+            {
+                var expiry = expiryGroup.Key?.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) ?? "-";
+                lines.Add($"Exp. {expiry}");
+
+                foreach (var leg in expiryGroup
+                             .OrderBy(static x => x.TimestampUtc)
+                             .ThenBy(static x => x.Symbol, StringComparer.OrdinalIgnoreCase))
+                {
+                    lines.Add(await FormatLegAsync(leg, cancellationToken));
+                }
+            }
+
+            var ungroupedNonOptionLegs = nonOptionLegs
+                .Where(static x => !IsExpiringFutureLeg(x))
+                .OrderBy(static x => x.TimestampUtc)
+                .ThenBy(static x => x.Symbol, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+
+            if (expiringFutureGroups.Length > 0 && ungroupedNonOptionLegs.Length > 0)
+            {
+                lines.Add(string.Empty);
+            }
+
+            foreach (var leg in ungroupedNonOptionLegs)
             {
                 lines.Add(await FormatLegAsync(leg, cancellationToken));
             }
@@ -487,7 +523,7 @@ public sealed class BlockTradeAlertService(
 
     private async Task<string> FormatLegAsync(BlockTradeLeg leg, CancellationToken cancellationToken)
     {
-        var side = CultureInfo.InvariantCulture.TextInfo.ToTitleCase(leg.Side.ToLowerInvariant());
+        var side = ResolveTelegramSideLabel(leg);
         var quantity = ResolveDisplayQuantity(leg).ToString("0.####", CultureInfo.InvariantCulture);
 
         if (IsOptionLeg(leg))
@@ -865,6 +901,14 @@ public sealed class BlockTradeAlertService(
         leg.StrikePrice is not null ||
         !string.IsNullOrWhiteSpace(leg.OptionSide);
 
+    private static bool IsExpiringFutureLeg(BlockTradeLeg leg) =>
+        leg.InstrumentType is InstrumentType.InverseFutures or InstrumentType.LinearFutures ||
+        (leg.ExpiryUtc is not null &&
+         leg.StrikePrice is null &&
+         string.IsNullOrWhiteSpace(leg.OptionSide) &&
+         !leg.Symbol.Contains("PERP", StringComparison.OrdinalIgnoreCase) &&
+         !leg.Symbol.Contains("PERPETUAL", StringComparison.OrdinalIgnoreCase));
+
     private static bool IsUsdLike(string? asset) =>
         asset is not null &&
         (asset.Equals("USD", StringComparison.OrdinalIgnoreCase) ||
@@ -887,58 +931,31 @@ public sealed class BlockTradeAlertService(
         return leg.Quantity;
     }
 
-    private static decimal EstimateStandaloneTradeUsdNotional(
-        InstrumentType instrumentType,
-        string baseAsset,
-        string quoteAsset,
-        string settleAsset,
-        decimal quantity,
-        decimal? amount,
-        decimal price,
-        decimal? indexPrice,
-        decimal? markPrice)
+    private static string ResolveTelegramSideLabel(BlockTradeLeg leg)
     {
-        if (instrumentType == InstrumentType.Option)
+        if (leg.OpenInterestDelta is not { } openInterestDelta || openInterestDelta == 0)
         {
-            if (IsUsdLike(settleAsset) || IsUsdLike(quoteAsset))
-            {
-                return Math.Abs(price * quantity);
-            }
-
-            if (IsPriceQuotedInBaseAsset(baseAsset, settleAsset))
-            {
-                var underlyingPrice = indexPrice ?? markPrice;
-                return underlyingPrice is > 0
-                    ? Math.Abs(price * quantity * underlyingPrice.Value)
-                    : 0m;
-            }
-
-            return 0m;
+            return CultureInfo.InvariantCulture.TextInfo.ToTitleCase(leg.Side.ToLowerInvariant());
         }
 
-        if (amount is not null && IsUsdLike(quoteAsset))
+        var isBuy = leg.Side.Equals("buy", StringComparison.OrdinalIgnoreCase);
+        return (isBuy, openInterestDelta > 0) switch
         {
-            return Math.Abs(amount.Value);
-        }
-
-        if (IsUsdLike(quoteAsset) || IsUsdLike(settleAsset))
-        {
-            if (IsPriceQuotedInBaseAsset(baseAsset, settleAsset))
-            {
-                var referencePrice = indexPrice ?? markPrice;
-                return referencePrice is > 0
-                    ? Math.Abs((quantity / referencePrice.Value) * price)
-                    : 0m;
-            }
-
-            return Math.Abs(price * quantity);
-        }
-
-        var assetPrice = indexPrice ?? markPrice;
-        return assetPrice is > 0
-            ? Math.Abs(quantity * assetPrice.Value)
-            : 0m;
+            (true, true) => "Open Long",
+            (false, true) => "Open Short",
+            (true, false) => "Close Short",
+            (false, false) => "Close Long"
+        };
     }
+
+    private static string ResolveAlertTitle(BlockTradeGroup group) =>
+        group.GroupType switch
+        {
+            "block_trade_id" or "block_rfq_id" => "BLOCK TRADE",
+            "combo_trade_id" or "combo_id" => "COMBO TRADE",
+            "trade_id" => "TRADE",
+            _ => "TRADE"
+        };
 
     private static string ResolveNonOptionType(BlockTradeLeg leg)
     {
@@ -1037,137 +1054,6 @@ public sealed class BlockTradeAlertService(
     private static string BuildTradeKey(string exchange, string symbol, string tradeId, DateTime timestampUtc) =>
         $"{exchange}|{symbol}|{tradeId}|{timestampUtc:O}";
 
-    private bool TryResolveAlertGroupKey(
-        InstrumentDefinition instrument,
-        ExchangeTrade trade,
-        out string groupKey,
-        out string groupId,
-        out string groupType)
-    {
-        if (TryResolveStructuredAlertGroupKey(
-                trade.BlockTradeId,
-                trade.BlockRfqId,
-                trade.ComboTradeId,
-                trade.ComboId,
-                out groupKey,
-                out groupId,
-                out groupType))
-        {
-            return true;
-        }
-
-        if (EstimateStandaloneTradeUsdNotional(
-                instrument.InstrumentType,
-                instrument.BaseAsset,
-                instrument.QuoteAsset,
-                instrument.SettleAsset,
-                trade.Quantity,
-                trade.Amount,
-                trade.Price,
-                trade.IndexPrice,
-                trade.MarkPrice) >= _options.MinGroupUsd &&
-            TryResolveAlertGroupIdentity(
-                "trade_id",
-                trade.TradeId,
-                out groupId,
-                out groupType))
-        {
-            groupKey = $"{groupType}|{groupId}";
-            return true;
-        }
-
-        groupKey = string.Empty;
-        groupId = string.Empty;
-        groupType = string.Empty;
-        return false;
-    }
-
-    private bool TryResolveAlertGroupKey(
-        TradeRecord trade,
-        out string groupKey,
-        out string groupId,
-        out string groupType)
-    {
-        if (TryResolveStructuredAlertGroupKey(
-                trade.BlockTradeId,
-                trade.BlockRfqId,
-                trade.ComboTradeId,
-                trade.ComboId,
-                out groupKey,
-                out groupId,
-                out groupType))
-        {
-            return true;
-        }
-
-        if (EstimateStandaloneTradeUsdNotional(
-                trade.InstrumentType,
-                trade.BaseAsset,
-                trade.QuoteAsset,
-                trade.SettleAsset,
-                trade.Quantity,
-                trade.Amount,
-                trade.Price,
-                trade.IndexPrice,
-                trade.MarkPrice) >= _options.MinGroupUsd &&
-            TryResolveAlertGroupIdentity(
-                "trade_id",
-                trade.TradeId,
-                out groupId,
-                out groupType))
-        {
-            groupKey = $"{groupType}|{groupId}";
-            return true;
-        }
-
-        groupKey = string.Empty;
-        groupId = string.Empty;
-        groupType = string.Empty;
-        return false;
-    }
-
-    private static bool TryResolveStructuredAlertGroupKey(
-        string? blockTradeId,
-        string? blockRfqId,
-        string? comboTradeId,
-        string? comboId,
-        out string groupKey,
-        out string groupId,
-        out string groupType)
-    {
-        if (TryResolveAlertGroupIdentity("block_trade_id", blockTradeId, out groupId, out groupType) ||
-            TryResolveAlertGroupIdentity("block_rfq_id", blockRfqId, out groupId, out groupType) ||
-            TryResolveAlertGroupIdentity("combo_trade_id", comboTradeId, out groupId, out groupType) ||
-            TryResolveAlertGroupIdentity("combo_id", comboId, out groupId, out groupType))
-        {
-            groupKey = $"{groupType}|{groupId}";
-            return true;
-        }
-
-        groupKey = string.Empty;
-        groupId = string.Empty;
-        groupType = string.Empty;
-        return false;
-    }
-
-    private static bool TryResolveAlertGroupIdentity(
-        string type,
-        string? value,
-        out string groupId,
-        out string groupType)
-    {
-        if (!string.IsNullOrWhiteSpace(value))
-        {
-            groupId = value;
-            groupType = type;
-            return true;
-        }
-
-        groupId = string.Empty;
-        groupType = string.Empty;
-        return false;
-    }
-
     private sealed class BlockTradeGroup
     {
         private readonly Lock _gate = new();
@@ -1237,7 +1123,15 @@ public sealed class BlockTradeAlertService(
         decimal Notional,
         string GroupId,
         string GroupType,
-        DateTime TimestampUtc);
+        decimal? PreTradeOpenInterest,
+        decimal? PostTradeOpenInterest,
+        DateTime TimestampUtc)
+    {
+        public decimal? OpenInterestDelta =>
+            PreTradeOpenInterest is null || PostTradeOpenInterest is null
+                ? null
+                : PostTradeOpenInterest.Value - PreTradeOpenInterest.Value;
+    }
 
     private sealed record EvaluatedBlockTradeLeg(
         BlockTradeLeg Leg,
@@ -1248,5 +1142,4 @@ public sealed class BlockTradeAlertService(
         decimal TimeToExpiryYears);
 
     private sealed record ConvertedOptionAmounts(string UnitPriceText, string TotalPremiumValueText, string TotalPremiumText);
-    private sealed record PendingTrade(InstrumentDefinition Instrument, ExchangeTrade Trade, bool UpdateCursor);
 }

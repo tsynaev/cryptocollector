@@ -15,6 +15,7 @@ var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.Configure<StorageOptions>(builder.Configuration.GetSection(StorageOptions.SectionName));
 builder.Services.Configure<TelegramOptions>(builder.Configuration.GetSection(TelegramOptions.SectionName));
+builder.Services.Configure<AggregationOptions>(builder.Configuration.GetSection(AggregationOptions.SectionName));
 builder.Services.Configure<BlockTradesAlertOptions>(builder.Configuration.GetSection(BlockTradesAlertOptions.SectionName));
 
 builder.Services.AddEndpointsApiExplorer();
@@ -25,6 +26,7 @@ builder.Services.AddSingleton<DailyParquetStore>();
 builder.Services.AddSingleton<ServiceStateStore>();
 builder.Services.AddSingleton<BlackScholesPricer>();
 builder.Services.AddSingleton<PositionPnlChartRenderer>();
+builder.Services.AddSingleton<ILocalMessageBus, LocalMessageBus>();
 builder.Services.AddHttpClient(nameof(TelegramMessageQueue));
 builder.Services.AddSingleton<TelegramMessageQueue>();
 builder.Services.AddSingleton<IMessageQueue>(sp => sp.GetRequiredService<TelegramMessageQueue>());
@@ -43,21 +45,18 @@ builder.Services.AddSingleton<IHostedService>(sp => new ExchangeCollectorService
     sp.GetRequiredService<DailyParquetStore>(),
     sp.GetRequiredService<IMarketDataSink>(),
     sp.GetRequiredService<IFlushableMarketDataSink>(),
-    sp.GetRequiredService<BlockTradeAlertService>(),
     sp.GetRequiredService<ILogger<ExchangeCollectorService>>()));
 builder.Services.AddSingleton<IHostedService>(sp => new ExchangeCollectorService(
     sp.GetRequiredService<BybitExchange>(),
     sp.GetRequiredService<DailyParquetStore>(),
     sp.GetRequiredService<IMarketDataSink>(),
     sp.GetRequiredService<IFlushableMarketDataSink>(),
-    sp.GetRequiredService<BlockTradeAlertService>(),
     sp.GetRequiredService<ILogger<ExchangeCollectorService>>()));
 builder.Services.AddSingleton<IHostedService>(sp => new ExchangeCollectorService(
     sp.GetRequiredService<DeribitExchange>(),
     sp.GetRequiredService<DailyParquetStore>(),
     sp.GetRequiredService<IMarketDataSink>(),
     sp.GetRequiredService<IFlushableMarketDataSink>(),
-    sp.GetRequiredService<BlockTradeAlertService>(),
     sp.GetRequiredService<ILogger<ExchangeCollectorService>>()));
 
 var app = builder.Build();
@@ -165,22 +164,13 @@ app.MapGet("/history/block-trades", async (
         ? SupportedExchanges
         : [exchange];
 
-    bool Predicate(TradeRecord row)
-    {
-        return row.IsBlockTrade ||
-               !string.IsNullOrWhiteSpace(row.BlockTradeId) ||
-               !string.IsNullOrWhiteSpace(row.BlockRfqId) ||
-               !string.IsNullOrWhiteSpace(row.ComboTradeId) ||
-               !string.IsNullOrWhiteSpace(row.ComboId);
-    }
-
-    var trades = await store.QueryAcrossExchangesAsync<TradeRecord>(
+    var trades = await store.QueryAcrossExchangesAsync<EnrichedBlockTradeRecord>(
         exchanges,
-        DataSetNames.Trades,
+        DataSetNames.BlockTrades,
         effectiveFrom.UtcDateTime,
         effectiveTo.UtcDateTime,
         symbol: null,
-        Predicate,
+        predicate: null,
         cancellationToken);
 
     var groups = BlockTradeHistoryBuilder.Build(trades, minGroupUsd ?? 0m);

@@ -46,4 +46,7 @@ public sealed class BlockTradeHistoryLeg
     public string? Liquidation { get; init; }
     public bool IsRpiTrade { get; init; }
     public string? Sequence { get; init; }
+    public decimal? PreTradeOpenInterest { get; init; }
+    public decimal? PostTradeOpenInterest { get; init; }
+    public decimal? OpenInterestDelta { get; init; }
 }

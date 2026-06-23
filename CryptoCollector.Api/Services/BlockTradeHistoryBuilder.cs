@@ -6,6 +6,60 @@ namespace CryptoCollector.Api.Services;
 public static class BlockTradeHistoryBuilder
 {
     public static IReadOnlyList<BlockTradeHistoryGroup> Build(
+        IEnumerable<EnrichedBlockTradeRecord> trades,
+        decimal minGroupUsd)
+    {
+        var groups = new Dictionary<string, List<EnrichedBlockTradeRecord>>(StringComparer.OrdinalIgnoreCase);
+        var metadata = new Dictionary<string, (string Exchange, string GroupId, string GroupType)>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var trade in trades)
+        {
+            if (string.IsNullOrWhiteSpace(trade.GroupId) || string.IsNullOrWhiteSpace(trade.GroupType))
+            {
+                continue;
+            }
+
+            var bucketKey = $"{trade.Exchange}|{trade.GroupType}|{trade.GroupId}";
+            if (!groups.TryGetValue(bucketKey, out var bucket))
+            {
+                bucket = [];
+                groups[bucketKey] = bucket;
+                metadata[bucketKey] = (trade.Exchange, trade.GroupId, trade.GroupType);
+            }
+
+            bucket.Add(trade);
+        }
+
+        return groups
+            .Select(entry =>
+            {
+                var groupMetadata = metadata[entry.Key];
+                var orderedLegs = entry.Value
+                    .OrderByDescending(static x => x.Date)
+                    .ThenBy(static x => x.Symbol, StringComparer.OrdinalIgnoreCase)
+                    .Select(MapLeg)
+                    .ToArray();
+
+                return new BlockTradeHistoryGroup
+                {
+                    Exchange = groupMetadata.Exchange,
+                    GroupId = groupMetadata.GroupId,
+                    GroupType = groupMetadata.GroupType,
+                    TimestampUtc = orderedLegs.Max(static x => x.Date),
+                    BaseAsset = orderedLegs.Select(static x => x.BaseAsset).FirstOrDefault(static x => !string.IsNullOrWhiteSpace(x)),
+                    TotalQuantity = orderedLegs.Sum(static x => x.Quantity),
+                    TotalUsdNotional = orderedLegs.Sum(static x => x.UsdNotional),
+                    LegCount = orderedLegs.Length,
+                    Legs = orderedLegs
+                };
+            })
+            .Where(x => x.TotalUsdNotional >= minGroupUsd)
+            .OrderByDescending(static x => x.TimestampUtc)
+            .ThenBy(static x => x.Exchange, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    public static IReadOnlyList<BlockTradeHistoryGroup> Build(
         IEnumerable<TradeRecord> trades,
         decimal minGroupUsd)
     {
@@ -89,7 +143,47 @@ public static class BlockTradeHistoryBuilder
             BlockRfqId = trade.BlockRfqId,
             Liquidation = trade.Liquidation,
             IsRpiTrade = trade.IsRpiTrade,
-            Sequence = trade.Sequence
+            Sequence = trade.Sequence,
+            PreTradeOpenInterest = null,
+            PostTradeOpenInterest = null,
+            OpenInterestDelta = null
+        };
+
+    private static BlockTradeHistoryLeg MapLeg(EnrichedBlockTradeRecord trade) =>
+        new()
+        {
+            Symbol = trade.Symbol,
+            InstrumentType = trade.InstrumentType,
+            BaseAsset = trade.BaseAsset,
+            QuoteAsset = trade.QuoteAsset,
+            SettleAsset = trade.SettleAsset,
+            Date = trade.Date,
+            ExpiryUtc = trade.ExpiryUtc,
+            StrikePrice = trade.StrikePrice,
+            OptionSide = trade.OptionSide,
+            TradeId = trade.TradeId,
+            Side = trade.Side,
+            Quantity = trade.Quantity,
+            Contracts = trade.Contracts,
+            Amount = trade.Amount,
+            Price = trade.Price,
+            MarkPrice = trade.MarkPrice,
+            IndexPrice = trade.IndexPrice,
+            Iv = trade.Iv,
+            MarkIv = trade.MarkIv,
+            UsdNotional = trade.UsdNotional,
+            IsBlockTrade = trade.IsBlockTrade,
+            BlockTradeId = trade.BlockTradeId,
+            BlockTradeLegCount = trade.BlockTradeLegCount,
+            ComboId = trade.ComboId,
+            ComboTradeId = trade.ComboTradeId,
+            BlockRfqId = trade.BlockRfqId,
+            Liquidation = trade.Liquidation,
+            IsRpiTrade = trade.IsRpiTrade,
+            Sequence = trade.Sequence,
+            PreTradeOpenInterest = trade.PreTradeOpenInterest,
+            PostTradeOpenInterest = trade.PostTradeOpenInterest,
+            OpenInterestDelta = trade.OpenInterestDelta
         };
 
     private static bool TryResolveGroup(

@@ -12,7 +12,6 @@ public sealed class ExchangeCollectorService(
     DailyParquetStore store,
     IMarketDataSink marketDataSink,
     IFlushableMarketDataSink flushableMarketDataSink,
-    BlockTradeAlertService blockTradeAlertService,
     ILogger<ExchangeCollectorService> logger) : BackgroundService
 {
     private const int BootstrapTradeFlushBatchSize = 5_000;
@@ -158,7 +157,6 @@ public sealed class ExchangeCollectorService(
         {
             case ExchangeTradeMessage trade:
                 marketDataSink.IngestTrade(trade.Instrument, trade.Trade);
-                blockTradeAlertService.IngestLiveTrade(trade.Instrument, trade.Trade);
                 break;
             case ExchangeTickerMessage ticker:
                 marketDataSink.IngestTicker(ticker.Instrument, ticker.Ticker);
@@ -181,7 +179,6 @@ public sealed class ExchangeCollectorService(
         await foreach (var trade in exchange.StreamTradesSinceAsync(instruments, catchUpFromUtc, cancellationToken))
         {
             marketDataSink.IngestTrade(trade.Instrument, trade.Trade);
-            blockTradeAlertService.IngestRecoveredTrade(trade.Instrument, trade.Trade);
             processedCount++;
 
             if (processedCount % BootstrapTradeFlushBatchSize == 0)
