@@ -139,21 +139,21 @@ public sealed class TelegramMessageQueue : BackgroundService, IMessageQueue
         }, cancellationToken: cancellationToken);
     }
 
-    private Task<HttpResponseMessage> SendPhotoMessageAsync(
+    private async Task<HttpResponseMessage> SendPhotoMessageAsync(
         HttpClient client,
         OutboundMessage message,
         CancellationToken cancellationToken)
     {
         var endpoint = $"https://api.telegram.org/bot{_options.BotToken}/sendPhoto";
-        var content = new MultipartFormDataContent();
+        using var content = new MultipartFormDataContent();
         content.Add(new StringContent(_options.ChatId), "chat_id");
         content.Add(new StringContent(message.Caption), "caption");
         content.Add(new StringContent("HTML"), "parse_mode");
 
-        var photoContent = new ByteArrayContent(message.PhotoBytes!);
+        using var photoContent = new ByteArrayContent(message.PhotoBytes!);
         photoContent.Headers.ContentType = new MediaTypeHeaderValue("image/png");
         content.Add(photoContent, "photo", message.PhotoFileName ?? "chart.png");
 
-        return client.PostAsync(endpoint, content, cancellationToken);
+        return await client.PostAsync(endpoint, content, cancellationToken);
     }
 }

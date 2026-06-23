@@ -39,7 +39,8 @@ public sealed class PositionPnlChartRenderer
         using var gridPaint = new SKPaint { Color = new SKColor(230, 230, 230), StrokeWidth = 1, IsAntialias = true };
         using var axisPaint = new SKPaint { Color = SKColors.Black, StrokeWidth = 2, IsAntialias = true };
         using var zeroPaint = new SKPaint { Color = new SKColor(180, 60, 60), StrokeWidth = 2, IsAntialias = true };
-        using var spotPaint = new SKPaint { Color = new SKColor(50, 100, 200), StrokeWidth = 2, IsAntialias = true, PathEffect = SKPathEffect.CreateDash([8, 8], 0) };
+        using var spotPathEffect = SKPathEffect.CreateDash([8, 8], 0);
+        using var spotPaint = new SKPaint { Color = new SKColor(50, 100, 200), StrokeWidth = 2, IsAntialias = true, PathEffect = spotPathEffect };
         using var expiryLinePaint = new SKPaint { Color = new SKColor(0, 120, 90), StrokeWidth = 4, IsAntialias = true, Style = SKPaintStyle.Stroke };
         using var currentLinePaint = new SKPaint { Color = new SKColor(214, 110, 0), StrokeWidth = 4, IsAntialias = true, Style = SKPaintStyle.Stroke };
         using var textPaint = new SKPaint { Color = SKColors.Black, IsAntialias = true };
