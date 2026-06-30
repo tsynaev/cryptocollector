@@ -14,9 +14,15 @@ using Microsoft.Extensions.Options;
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.Configure<StorageOptions>(builder.Configuration.GetSection(StorageOptions.SectionName));
-builder.Services.Configure<TelegramOptions>(builder.Configuration.GetSection(TelegramOptions.SectionName));
 builder.Services.Configure<AggregationOptions>(builder.Configuration.GetSection(AggregationOptions.SectionName));
 builder.Services.Configure<BlockTradesAlertOptions>(builder.Configuration.GetSection(BlockTradesAlertOptions.SectionName));
+builder.Services
+    .AddOptions<TelegramOptions>()
+    .Bind(builder.Configuration.GetSection(TelegramOptions.SectionName))
+    .Validate(
+        options => !options.Enabled || (!string.IsNullOrWhiteSpace(options.BotToken) && !string.IsNullOrWhiteSpace(options.ChatId)),
+        "Telegram:BotToken and Telegram:ChatId are required when Telegram:Enabled=true.")
+    .ValidateOnStart();
 
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddOpenApi();

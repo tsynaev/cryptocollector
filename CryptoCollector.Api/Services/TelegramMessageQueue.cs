@@ -47,7 +47,17 @@ public sealed class TelegramMessageQueue : BackgroundService, IMessageQueue
             return false;
         }
 
-        return _channel.Writer.TryWrite(message);
+        var written = _channel.Writer.TryWrite(message);
+        if (!written)
+        {
+            _logger.LogWarning(
+                "Telegram message queue is full. QueueCapacity={QueueCapacity}, CaptionLength={CaptionLength}, HasPhoto={HasPhoto}.",
+                _options.QueueCapacity,
+                message.Caption.Length,
+                message.PhotoBytes is not null);
+        }
+
+        return written;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -62,7 +72,12 @@ public sealed class TelegramMessageQueue : BackgroundService, IMessageQueue
             return;
         }
 
-        _logger.LogInformation("Telegram sender started.");
+        _logger.LogInformation(
+            "Telegram sender started. Enabled={Enabled}, HasBotToken={HasBotToken}, HasChatId={HasChatId}, QueueCapacity={QueueCapacity}.",
+            _options.Enabled,
+            !string.IsNullOrWhiteSpace(_options.BotToken),
+            !string.IsNullOrWhiteSpace(_options.ChatId),
+            _options.QueueCapacity);
 
         var client = _httpClientFactory.CreateClient(nameof(TelegramMessageQueue));
         await foreach (var message in _channel.Reader.ReadAllAsync(stoppingToken))
