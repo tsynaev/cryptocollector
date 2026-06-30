@@ -191,7 +191,18 @@ public sealed class MinuteAggregationService(
         {
             while (!stoppingToken.IsCancellationRequested && await timer.WaitForNextTickAsync(stoppingToken))
             {
-                await FlushAsync(includeCurrentMinute: false, stoppingToken);
+                try
+                {
+                    await FlushAsync(includeCurrentMinute: false, stoppingToken);
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (Exception exception)
+                {
+                    logger.LogError(exception, "Minute aggregation loop failed. Continuing.");
+                }
             }
         }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)

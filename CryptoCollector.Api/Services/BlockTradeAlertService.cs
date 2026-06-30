@@ -72,10 +72,21 @@ public sealed class BlockTradeAlertService : BackgroundService
         {
             while (!stoppingToken.IsCancellationRequested && await timer.WaitForNextTickAsync(stoppingToken))
             {
-                await FlushReadyGroupsAsync(stoppingToken);
-                if (ShouldPersistState())
+                try
                 {
-                    await PersistStateAsync(stoppingToken);
+                    await FlushReadyGroupsAsync(stoppingToken);
+                    if (ShouldPersistState())
+                    {
+                        await PersistStateAsync(stoppingToken);
+                    }
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (Exception exception)
+                {
+                    logger.LogError(exception, "Block trade alert loop failed. Continuing.");
                 }
             }
         }
