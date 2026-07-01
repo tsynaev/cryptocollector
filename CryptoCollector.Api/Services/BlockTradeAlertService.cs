@@ -4,22 +4,14 @@ using System.Text.Encodings.Web;
 using CryptoCollector.API.Exchange.Models;
 using CryptoCollector.Api.Models;
 using CryptoCollector.Api.Options;
-using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 namespace CryptoCollector.Api.Services;
 
 public sealed class BlockTradeAlertService : BackgroundService
 {
-    private const string StateKey = "block-trade-alert";
     private const int TelegramCaptionLimit = 1024;
-    private static readonly TimeSpan PersistInterval = TimeSpan.FromSeconds(30);
-    private static readonly TimeSpan ReplayLookbackWindow = TimeSpan.FromMinutes(30);
-    private static readonly string[] Exchanges = ["binance", "bybit", "deribit"];
-
     private readonly DailyParquetStore store;
-    private readonly ServiceStateStore stateStore;
     private readonly IMessageQueue messageQueue;
     private readonly PositionPnlChartRenderer chartRenderer;
     private readonly BlackScholesPricer blackScholesPricer;
@@ -28,14 +20,9 @@ public sealed class BlockTradeAlertService : BackgroundService
     private readonly ConcurrentDictionary<string, BlockTradeGroup> _groups = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentQueue<EnrichedBlockTradeRecord> _pendingCandidates = new();
     private readonly IDisposable _candidateSubscription;
-    private readonly Lock _stateGate = new();
-    private BlockTradeAlertState _state = new();
-    private volatile bool _stateDirty;
-    private DateTime _lastStatePersistedUtc = DateTime.MinValue;
 
     public BlockTradeAlertService(
         DailyParquetStore store,
-        ServiceStateStore stateStore,
         IOptions<BlockTradesAlertOptions> options,
         ILocalMessageBus localMessageBus,
         IMessageQueue messageQueue,
@@ -44,7 +31,6 @@ public sealed class BlockTradeAlertService : BackgroundService
         ILogger<BlockTradeAlertService> logger)
     {
         this.store = store;
-        this.stateStore = stateStore;
         this.messageQueue = messageQueue;
         this.chartRenderer = chartRenderer;
         this.blackScholesPricer = blackScholesPricer;
@@ -59,13 +45,6 @@ public sealed class BlockTradeAlertService : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _state = await stateStore.ReadAsync<BlockTradeAlertState>(StateKey, stoppingToken) ?? new BlockTradeAlertState();
-        var exchangesToReplay = _state.Exchanges.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase);
-
-        await InitializeStateAsync(exchangesToReplay, stoppingToken);
-        await ReplayStoredBlockTradesAsync(exchangesToReplay, stoppingToken);
-        DrainPendingCandidates();
-
         using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(500));
 
         try
@@ -74,11 +53,8 @@ public sealed class BlockTradeAlertService : BackgroundService
             {
                 try
                 {
+                    DrainPendingCandidates();
                     await FlushReadyGroupsAsync(stoppingToken);
-                    if (ShouldPersistState())
-                    {
-                        await PersistStateAsync(stoppingToken);
-                    }
                 }
                 catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
                 {
@@ -99,161 +75,11 @@ public sealed class BlockTradeAlertService : BackgroundService
     {
         _candidateSubscription.Dispose();
         await FlushReadyGroupsAsync(cancellationToken, force: true);
-        await PersistStateAsync(cancellationToken, force: true);
         await base.StopAsync(cancellationToken);
     }
 
-    private async Task InitializeStateAsync(ISet<string> exchangesToReplay, CancellationToken cancellationToken)
+    private void IngestCore(EnrichedBlockTradeRecord trade)
     {
-        foreach (var exchange in Exchanges)
-        {
-            if (_state.Exchanges.ContainsKey(exchange))
-            {
-                continue;
-            }
-
-            var replayFromUtc = DateTime.UtcNow.AddHours(-24);
-
-            _state.Exchanges[exchange] = new AlertCursor
-            {
-                LastCheckedTradeUtc = replayFromUtc,
-                LastCheckedTradeKey = string.Empty
-            };
-
-            exchangesToReplay.Add(exchange);
-            _stateDirty = true;
-        }
-
-        if (_stateDirty)
-        {
-            await PersistStateAsync(cancellationToken, force: true);
-        }
-    }
-
-    private async Task ReplayStoredBlockTradesAsync(
-        IReadOnlySet<string> exchangesWithStoredCursor,
-        CancellationToken cancellationToken)
-    {
-        foreach (var exchange in Exchanges)
-        {
-            if (!exchangesWithStoredCursor.Contains(exchange) ||
-                !_state.Exchanges.TryGetValue(exchange, out var cursor))
-            {
-                continue;
-            }
-
-            var latestTradeTimestampUtc = await store.GetLatestTimestampAsync<EnrichedBlockTradeRecord>(exchange, DataSetNames.BlockTrades, cancellationToken);
-            if (latestTradeTimestampUtc is null || latestTradeTimestampUtc.Value < cursor.LastCheckedTradeUtc)
-            {
-                continue;
-            }
-
-            var replayFromUtc = cursor.LastCheckedTradeUtc - ReplayLookbackWindow;
-            var trades = await store.QueryAsync<EnrichedBlockTradeRecord>(
-                exchange,
-                DataSetNames.BlockTrades,
-                replayFromUtc,
-                latestTradeTimestampUtc.Value,
-                symbol: null,
-                cancellationToken);
-
-            foreach (var trade in trades
-                         .OrderBy(static x => x.Date)
-                         .ThenBy(static x => x.Symbol, StringComparer.OrdinalIgnoreCase)
-                         .ThenBy(static x => x.TradeId, StringComparer.Ordinal))
-            {
-                IngestStoredTrade(trade);
-            }
-        }
-
-        await FlushReadyGroupsAsync(cancellationToken, force: true);
-        if (_stateDirty)
-        {
-            await PersistStateAsync(cancellationToken, force: true);
-        }
-    }
-
-    private void IngestCore(EnrichedBlockTradeRecord trade, bool updateCursor)
-    {
-        var timestamp = trade.Date;
-        var tradeKey = BuildTradeKey(trade.Exchange, trade.Symbol, trade.TradeId, timestamp);
-
-        if (updateCursor && !ShouldProcessTrade(trade.Exchange, timestamp, tradeKey))
-        {
-            return;
-        }
-
-        if (!_options.Enabled || string.IsNullOrWhiteSpace(trade.GroupId) || string.IsNullOrWhiteSpace(trade.GroupType))
-        {
-            return;
-        }
-
-        var leg = new BlockTradeLeg(
-            trade.Exchange,
-            trade.Symbol,
-            trade.InstrumentType,
-            trade.BaseAsset,
-            trade.QuoteAsset,
-            trade.SettleAsset,
-            trade.ExpiryUtc,
-            trade.StrikePrice,
-            trade.OptionSide,
-            trade.Side,
-            trade.Quantity,
-            trade.Contracts,
-            trade.Amount,
-            trade.Price,
-            trade.MarkPrice,
-            trade.IndexPrice,
-            trade.Iv,
-            trade.MarkIv,
-            trade.Notional,
-            trade.GroupId,
-            trade.GroupType,
-            trade.PreTradeOpenInterest,
-            trade.PostTradeOpenInterest,
-            timestamp);
-
-        _groups.AddOrUpdate(
-            $"{trade.Exchange}|{trade.GroupType}|{trade.GroupId}",
-            _ => new BlockTradeGroup(leg, _options.GroupWindow),
-            (_, existing) =>
-            {
-                existing.Add(leg, _options.GroupWindow);
-                return existing;
-            });
-    }
-
-    private void DrainPendingCandidates()
-    {
-        if (_pendingCandidates.IsEmpty)
-        {
-            return;
-        }
-
-        var bufferedTrades = new List<EnrichedBlockTradeRecord>();
-        while (_pendingCandidates.TryDequeue(out var pendingTrade))
-        {
-            bufferedTrades.Add(pendingTrade);
-        }
-
-        foreach (var pendingTrade in bufferedTrades
-                     .OrderBy(static x => x.Date)
-                     .ThenBy(static x => x.Symbol, StringComparer.OrdinalIgnoreCase)
-                     .ThenBy(static x => x.TradeId, StringComparer.Ordinal))
-        {
-            IngestCore(pendingTrade, updateCursor: true);
-        }
-    }
-
-    private void IngestStoredTrade(EnrichedBlockTradeRecord trade)
-    {
-        var tradeKey = BuildTradeKey(trade.Exchange, trade.Symbol, trade.TradeId, trade.Date);
-        if (!ShouldProcessTrade(trade.Exchange, trade.Date, tradeKey))
-        {
-            return;
-        }
-
         if (!_options.Enabled || string.IsNullOrWhiteSpace(trade.GroupId) || string.IsNullOrWhiteSpace(trade.GroupType))
         {
             return;
@@ -295,81 +121,40 @@ public sealed class BlockTradeAlertService : BackgroundService
             });
     }
 
-    private bool ShouldProcessTrade(string exchange, DateTime timestampUtc, string tradeKey)
+    private void DrainPendingCandidates()
     {
-        lock (_stateGate)
+        if (_pendingCandidates.IsEmpty)
         {
-            if (_state.Exchanges.TryGetValue(exchange, out var cursor))
-            {
-                if (timestampUtc < cursor.LastCheckedTradeUtc)
-                {
-                    return false;
-                }
-
-                if (timestampUtc == cursor.LastCheckedTradeUtc &&
-                    string.CompareOrdinal(tradeKey, cursor.LastCheckedTradeKey) <= 0)
-                {
-                    return false;
-                }
-            }
-
-            _state.Exchanges[exchange] = new AlertCursor
-            {
-                LastCheckedTradeUtc = timestampUtc,
-                LastCheckedTradeKey = tradeKey
-            };
-            _stateDirty = true;
-            return true;
-        }
-    }
-
-    private bool ShouldPersistState()
-    {
-        if (!_stateDirty)
-        {
-            return false;
+            return;
         }
 
-        return DateTime.UtcNow - _lastStatePersistedUtc >= PersistInterval;
-    }
-
-    private async Task PersistStateAsync(CancellationToken cancellationToken, bool force = false)
-    {
-        BlockTradeAlertState snapshot;
-        lock (_stateGate)
+        var bufferedTrades = new List<EnrichedBlockTradeRecord>();
+        while (_pendingCandidates.TryDequeue(out var pendingTrade))
         {
-            if (!_stateDirty)
-            {
-                return;
-            }
-
-            if (!force && DateTime.UtcNow - _lastStatePersistedUtc < PersistInterval)
-            {
-                return;
-            }
-
-            snapshot = new BlockTradeAlertState
-            {
-                Exchanges = new Dictionary<string, AlertCursor>(_state.Exchanges, StringComparer.OrdinalIgnoreCase)
-            };
-            _stateDirty = false;
+            bufferedTrades.Add(pendingTrade);
         }
 
-        await stateStore.WriteAsync(StateKey, snapshot, cancellationToken);
-        _lastStatePersistedUtc = DateTime.UtcNow;
+        foreach (var pendingTrade in bufferedTrades
+                     .OrderBy(static x => x.Date)
+                     .ThenBy(static x => x.Symbol, StringComparer.OrdinalIgnoreCase)
+                     .ThenBy(static x => x.TradeId, StringComparer.Ordinal))
+        {
+            IngestCore(pendingTrade);
+        }
     }
 
     private async Task FlushReadyGroupsAsync(CancellationToken cancellationToken, bool force = false)
     {
         var now = DateTime.UtcNow;
 
-        foreach (var entry in _groups)
-        {
-            if (!force && entry.Value.FlushAfterUtc > now)
-            {
-                continue;
-            }
+        var readyGroups = _groups
+            .Where(entry => force || entry.Value.FlushAfterUtc <= now)
+            .OrderBy(entry => GetGroupTimestampUtc(entry.Value))
+            .ThenBy(entry => entry.Key, StringComparer.Ordinal)
+            .ToArray();
 
+        foreach (var entry in readyGroups)
+        {
             if (!_groups.TryRemove(entry.Key, out var group))
             {
                 continue;
@@ -397,6 +182,11 @@ public sealed class BlockTradeAlertService : BackgroundService
             }
         }
     }
+
+    private static DateTime GetGroupTimestampUtc(BlockTradeGroup group) =>
+        group.Legs.Count == 0
+            ? DateTime.MinValue
+            : group.Legs.Min(static leg => leg.TimestampUtc);
 
     private async Task<bool> TryEnqueueAlertAsync(
         BlockTradeGroup group,
@@ -1061,9 +851,6 @@ public sealed class BlockTradeAlertService : BackgroundService
     private static bool MatchesUnderlyingSnapshot(TickerMinuteBar row, BlockTradeLeg leg, bool requireTimestampMatch) =>
         (!requireTimestampMatch || row.Date <= leg.TimestampUtc) &&
         ((row.IndexPrice ?? row.MarkPrice ?? row.LastPrice) ?? 0m) > 0;
-
-    private static string BuildTradeKey(string exchange, string symbol, string tradeId, DateTime timestampUtc) =>
-        $"{exchange}|{symbol}|{tradeId}|{timestampUtc:O}";
 
     private sealed class BlockTradeGroup
     {

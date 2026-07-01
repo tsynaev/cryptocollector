@@ -29,7 +29,6 @@ builder.Services.AddOpenApi();
 builder.Services.AddSwaggerGen();
 
 builder.Services.AddSingleton<DailyParquetStore>();
-builder.Services.AddSingleton<ServiceStateStore>();
 builder.Services.AddSingleton<BlackScholesPricer>();
 builder.Services.AddSingleton<PositionPnlChartRenderer>();
 builder.Services.AddSingleton<ILocalMessageBus, LocalMessageBus>();

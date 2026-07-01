@@ -178,8 +178,6 @@ public sealed class MinuteAggregationService(
         {
             return;
         }
-
-        localMessageBus.Publish(record);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -292,6 +290,14 @@ public sealed class MinuteAggregationService(
         await AppendByExchangeAsync(DataSetNames.BlockTrades, blockTradeRows, cancellationToken);
         await AppendByExchangeAsync(DataSetNames.Tickers, tickerRows, cancellationToken);
         await AppendByExchangeAsync(DataSetNames.OptionChain, optionRows, cancellationToken);
+
+        foreach (var blockTradeRow in blockTradeRows
+                     .OrderBy(static x => x.Date)
+                     .ThenBy(static x => x.Symbol, StringComparer.OrdinalIgnoreCase)
+                     .ThenBy(static x => x.TradeId, StringComparer.Ordinal))
+        {
+            localMessageBus.Publish(blockTradeRow);
+        }
 
         if (tradeRows.Count + blockTradeRows.Count + tickerRows.Count + optionRows.Count > 0)
         {
